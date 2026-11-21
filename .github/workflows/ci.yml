@@ -1,0 +1,28 @@
+name: CI — typecheck and build
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # Build with dummy (non-secret) env so missing-env failures surface in CI.
+      # Real Cloudflare/Vercel env is NOT needed for a compile check.
+      - run: npm run build
+        env:
+          NEXT_PUBLIC_APP_URL: http://localhost:3000
+          INBOUND_WEBHOOK_TOKEN: dummy-inbound-token-for-build-only
+          DELIVERY_WEBHOOK_TOKEN: dummy-delivery-token-for-build-only
+          OPS_CRON_TOKEN: dummy-ops-token-for-build-only
+          PROVIDER_CREDENTIAL_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          MFA_ENFORCEMENT: 'false'
+      - name: Validate workflow YAML
+        run: python3 -c "import yaml,glob; [yaml.safe_load(open(f)) for f in glob.glob('.github/workflows/*.yml')]; print('workflows parse OK')"

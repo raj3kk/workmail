@@ -1,0 +1,16 @@
+name: WorkMail uptime monitor
+on:
+  schedule: [{cron: '*/10 * * * *'}]
+  workflow_dispatch:
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check deployed app and trigger alerting
+        env:
+          APP_URL: ${{ secrets.WORKMAIL_APP_URL }}
+          OPS_CRON_TOKEN: ${{ secrets.OPS_CRON_TOKEN }}
+        run: >-
+          curl --fail --silent --show-error --max-time 15
+          -H "Authorization: Bearer $OPS_CRON_TOKEN"
+          "$APP_URL/api/ops/monitor"

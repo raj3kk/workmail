@@ -1,0 +1,32 @@
+name: Encrypted backup
+on:
+  schedule: [{cron: '23 2 * * *'}]
+  workflow_dispatch:
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set backup date
+        id: backup-date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - name: Install wrangler and age
+        run: |
+          npm i -g wrangler
+          sudo apt-get update && sudo apt-get install -y age
+      - name: Run backup (D1 dump + KV attachment values, age-encrypted)
+        run: bash scripts/backup.sh
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
+          AGE_RECIPIENT: ${{ secrets.AGE_RECIPIENT }}
+      - name: Upload encrypted backup artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: workmail-backup-${{ steps.backup-date.outputs.date }}
+          retention-days: 90
+          path: |
+            workmail-backups/*.age
+            workmail-backups/*.sha256

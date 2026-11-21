@@ -1,0 +1,18 @@
+name = "workmail-inbound-email"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Vars (set in the Cloudflare dashboard or via `wrangler secret put` /
+# `wrangler deploy --var`; never commit secrets):
+#   WORKMAIL_API_URL — the Vercel app origin, e.g. https://workmail.vercel.app
+#     or the flow99.in app URL (no trailing slash). See DEPLOY.md.
+#   INBOUND_WEBHOOK_TOKEN — secret, must match the Vercel app's
+#     INBOUND_WEBHOOK_TOKEN exactly (set with `wrangler secret put`).
+# [vars]
+# WORKMAIL_API_URL = "https://workmail.vercel.app"
+#
+# Email Routing (custom address -> this worker) is manual dashboard setup:
+# Cloudflare dashboard > Email Routing > Routing Rules > Create rule, route
+# the address to this worker. There is no routing config in this file.
+# This worker stores nothing itself: it parses with PostalMime and POSTs to
+# the Vercel app's /api/inbound, which resolves the recipient mailbox.
