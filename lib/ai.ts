@@ -144,7 +144,13 @@ function truncate(s: string, max: number): string {
 async function callWorkersAi(cfg: AiConfig, userPrompt: string, systemPrompt: string): Promise<string> {
   const account = process.env.CLOUDFLARE_ACCOUNT_ID || '';
   const token = process.env.CLOUDFLARE_API_TOKEN || '';
-  const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/${encodeURIComponent(cfg.model)}`;
+  // The model name is part of the URL path with literal slashes
+  // (@cf/meta/llama-...). encodeURIComponent turns the slashes into %2F,
+  // which Cloudflare's router does not match ("No route for that URI").
+  // Keep the model raw; fall back to the default when it is not a
+  // well-formed Workers AI model id.
+  const model = /^@cf\/[A-Za-z0-9._\/-]+$/.test(cfg.model) ? cfg.model : AI_DEFAULT_WORKERS_MODEL;
+  const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/${model}`;
   const r = await fetch(url, {
     method: 'POST',
     headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'},
