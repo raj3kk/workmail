@@ -432,3 +432,34 @@ CREATE TRIGGER IF NOT EXISTS mailbox_owner_access AFTER INSERT ON mailboxes FOR 
   INSERT OR IGNORE INTO mailbox_members (mailbox_id, user_id, permission)
   SELECT NEW.id, NEW.created_by, 'manage' WHERE NEW.created_by IS NOT NULL;
 END;
+
+-- ==========================================================================
+-- Gap-fix migrations (2026-11-21) — ADDITIVE ONLY. Apply after the base
+-- schema above (wrangler d1 execute <db> --file=db/schema.sql). These
+-- statements are one-time migrations: re-running the ALTER TABLE lines
+-- against a database that already has the columns fails with
+-- "duplicate column name" — that is expected and harmless; the CREATE
+-- TABLE IF NOT EXISTS lines are safe to re-run.
+-- ==========================================================================
+
+-- G-23: outbound_jobs needs the original send payload (so the retry
+-- worker can re-send) and the provider that handled the last attempt.
+-- `status` already allows queued/processing/accepted/delivered/retry/
+-- failed/unknown; `attempts` and `next_attempt_at` already exist.
+ALTER TABLE outbound_jobs ADD COLUMN provider TEXT;
+ALTER TABLE outbound_jobs ADD COLUMN payload TEXT NOT NULL DEFAULT '{}';
+
+-- G-28: MFA recovery codes. Single-use, stored ONLY as SHA-256 hashes
+-- (see lib/mfa.ts generateRecoveryCodes/hashRecoveryCode). Plain codes
+-- are shown once at enrolment/regeneration and never stored or logged.
+-- A used code is burned by setting used_at; verification only accepts
+-- rows with used_at IS NULL.
+CREATE TABLE IF NOT EXISTS recovery_codes (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (user_id, code_hash)
+);
+CREATE INDEX IF NOT EXISTS recovery_codes_user_idx ON recovery_codes(user_id, used_at);

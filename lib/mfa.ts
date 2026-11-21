@@ -58,6 +58,41 @@ export function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
+// --- MFA recovery codes (G-28) ---------------------------------------------
+// Single-use codes, shown once at enrolment (or on explicit regeneration),
+// stored ONLY as SHA-256 hashes. Plain codes are never logged, never
+// persisted, and never returned again after the one response that creates
+// them. Format: 3 groups of 4 unambiguous characters (no 0/O, 1/I/L),
+// e.g. "7KQ2-9XFM-4D8Z". Verification strips separators and case.
+export const RECOVERY_CODE_COUNT = 10;
+const RECOVERY_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+export function generateRecoveryCodes(count: number = RECOVERY_CODE_COUNT): string[] {
+  const codes: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const bytes = randomBytes(12);
+    let raw = '';
+    for (const b of bytes) raw += RECOVERY_ALPHABET[b % RECOVERY_ALPHABET.length];
+    codes.push(`${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`);
+  }
+  return codes;
+}
+
+/** Canonical form for hashing/comparison: separators and case removed. */
+export function normalizeRecoveryCode(code: string): string {
+  return String(code || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+}
+
+/** SHA-256 of the canonical form — the only representation ever stored. */
+export function hashRecoveryCode(code: string): string {
+  return createHash('sha256').update(normalizeRecoveryCode(code)).digest('hex');
+}
+
+/** True when the value looks like a recovery code (12 alphanumerics). */
+export function looksLikeRecoveryCode(code: string): boolean {
+  return /^[A-Za-z0-9]{12}$/.test(normalizeRecoveryCode(code));
+}
+
 export function newSessionToken(): string {
   return randomBytes(32).toString('base64url');
 }

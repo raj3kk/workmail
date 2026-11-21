@@ -54,3 +54,32 @@ Set `OPS_CRON_TOKEN` and optional `ALERT_WEBHOOK_URL`. Set GitHub secrets `WORKM
 7. Complete load test at expected peak, alert runbook, incident response, privacy/terms and legal review.
 
 A successful build or static test does not prove production readiness. Do not onboard real customer mailboxes until all release gates are signed off.
+
+## Outbound retry policy (G-23)
+
+`/api/send` writes one `outbound_jobs` row per send (payload + provider +
+status). `POST /api/ops/reconcile` (Bearer `OPS_CRON_TOKEN`) consumes due
+rows on every tick via `lib/retry.ts` `processDueOutboundJobs()`:
+
+- **Retried:** only `queued`/`retry` rows whose `next_attempt_at` has
+  passed. Each attempt re-runs the shared send pipeline (`executeSend`),
+  so domain verification, monthly cap, suppression and per-provider caps
+  are re-checked, and a fresh idempotency key (`retry:<job-id>:<n>`) is
+  used — the original key is already marked `failed`, and a `failed`
+  outcome means no provider accepted the mail, so the retry cannot
+  duplicate a delivery.
+- **Backoff:** 1m, 5m, 15m, 30m, 60m between attempts; **max 5 attempts**,
+  then the job is `failed` (terminal).
+- **`unknown` is NEVER auto-retried.** A provider timeout means the mail
+  may already have been delivered; retrying could duplicate it. `unknown`
+  rows are flagged by reconcile for manual/provider-log reconciliation
+  only. The same rule applies to a retry attempt that itself times out.
+- **`failed` is terminal:** suppression, definitive rejection, bad
+  payload, suspended workspace, or attempts exhausted. A `failed` job is
+  never retried automatically.
+- **Claiming:** jobs are claimed with `locked_at` before work starts so
+  two concurrent reconcile ticks cannot retry the same job. A job stuck
+  in `processing` for >15 minutes is flagged `unknown` by reconcile.
+- **Audit:** every transition updates `attempts`, `next_attempt_at`,
+  `last_error`, `provider` and `message_id` on the job row. The
+  idempotency key remains the source of truth for the send outcome.

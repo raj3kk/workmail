@@ -36,3 +36,30 @@ Never commit `.env`, `.env.local`, API tokens, provider keys or the
 encryption key. `.env.example` contains placeholders only. Rotate any
 credential that is ever exposed, in both the host env and the Cloudflare
 Worker secrets.
+
+## MFA recovery codes and break-glass (G-28)
+
+- **Recovery codes:** when a user completes TOTP enrolment
+  (`POST /api/auth/mfa/verify` with the pending secret), the API returns
+  10 single-use recovery codes **once** in that response. They are stored
+  only as SHA-256 hashes (`recovery_codes.code_hash`); plain codes are
+  never stored, never logged, and never returned again. A code can be
+  used at `/api/auth/mfa/verify` in place of a TOTP code; a successful use
+  burns it (`used_at` set) and verifies the session exactly like a TOTP
+  code. An enrolled user with a fully MFA-verified session can regenerate
+  a set via `POST /api/auth/mfa/setup` with
+  `{"action": "recovery_codes"}` — old unused codes are revoked on
+  regeneration. When the last code is used, the response warns the user
+  to regenerate while they still have authenticator access.
+- **Break-glass (lost authenticator AND lost recovery codes):** there is
+  no self-service reset by design. A platform admin must verify the
+  user's identity out of band (through the verified support channel),
+  then clear the enrolment directly in D1 — delete the user's
+  `recovery_codes` rows and set `users.mfa_secret = NULL` and
+  `users.pending_mfa_secret = NULL` — and record the action in
+  `admin_actions` with the reason. The user then re-enrols TOTP from
+  scratch and receives a fresh set of recovery codes. Never disable MFA
+  by editing `platform_user_controls.mfa_required` for one user; that
+  flag is organisation policy, not a recovery mechanism. Treat every
+  break-glass reset as a security event: log it, tell the user, and ask
+  them to store the new recovery codes immediately.
