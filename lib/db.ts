@@ -48,15 +48,11 @@ export async function dbRun(sql: string, params: unknown[] = []): Promise<{chang
 }
 
 export async function dbBatch(statements: Array<{sql: string; params?: unknown[]}>): Promise<void> {
-  const {account, database, token} = cfg();
-  const r = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${account}/d1/database/${database}/batch`,
-    {method: 'POST', headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'}, body: JSON.stringify(statements), cache: 'no-store', signal: AbortSignal.timeout(15000)});
-  const j = await r.json().catch(() => null);
-  if (!r.ok || !j?.success) {
-    const msg = j?.errors?.map((e: any) => e.message).join('; ') || `D1 batch failed (HTTP ${r.status})`;
-    throw new Error(msg);
-  }
+  // NOTE (live-verified 2026-11-21): the D1 /batch endpoint returns
+  // 404 "Route not found" on this account, so batching is done as
+  // sequential /query calls. Same atomicity caveat as any multi-statement
+  // write: callers must not rely on all-or-nothing behaviour here.
+  for (const st of statements) await callD1({sql: st.sql, params: st.params ?? []});
 }
 
 // Convenience: JSON columns are stored as TEXT in D1.
