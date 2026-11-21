@@ -187,3 +187,73 @@ permission). No draft is created on error.
 - `app/page.tsx` — "✦ AI draft" in compose, "✦ AI reply" in the reader,
   AI status + auto-reply toggle + review queue in the sidebar.
 - `docs/AI-AGENT.md` — this file.
+
+## Training — "Train AI agent for your business"
+
+The owner teaches the agent about their business from **Settings →
+"Train AI agent for your business"**: business name and what it does,
+products/services, FAQs, tone/style, do's and don'ts, and sample
+replies. Entries are added by pasting text or uploading a `.txt`, `.md`,
+or `.csv` file (parsed server-side: `.txt`/`.md` split into sections,
+`.csv` reads `question,answer` columns — or first-cell = question,
+rest = answer when there is no header). No new npm dependency.
+
+### Storage (no schema change)
+
+- KV `ai:training/<workspace_id>/entries` — one JSON array (max 100
+  entries) of `{id, kind, title, content, source, filename, created_by,
+  created_at, updated_at}`. Kinds: `profile | product | faq | tone |
+  rule | sample_reply | document`. Follows the existing single-key
+  JSON-array pattern of `ai:queue/<workspace_id>`.
+- Training is workspace-scoped: the key embeds the workspace id, every
+  route checks workspace membership (writes additionally require
+  owner/admin), and retrieval only ever reads the caller's own
+  workspace key — another tenant's training can never leak into a
+  prompt. `lib/ai-training.ts` owns all access.
+
+### How the agent uses it
+
+- `generateDraftText(prompt, {workspaceId, inboundText})` (lib/ai.ts)
+  loads the workspace's training via `buildTrainingContext` and appends
+  it to the system prompt as a bounded block (max 4,000 chars). Profile
+  / tone / rule entries are always included first (they define the
+  voice); FAQ / product / sample-reply / document entries are ranked by
+  keyword overlap with the inbound message. The block tells the model
+  to answer in the business's voice and to use only the trained facts,
+  falling back to `[NEEDS HUMAN INPUT]` for anything not in the
+  training. Prompt version is `v2` (v1 was the untrained prompt).
+- This applies to **draft replies, draft compose, and auto-replies**:
+  the inbound auto-reply hook (`maybeAutoReply`) passes its workspace
+  id and the inbound subject + body, so auto-sent replies use the
+  training too. A training-load failure never breaks drafting — the
+  plain base prompt is used instead.
+- Training usage is logged as metadata only: `training_used:
+  {count, entry_ids}` on the `ai.training_*` and `ai.auto_reply_drafted`
+  KV log entries (and the audit mirror). No training content and no
+  message body is ever logged.
+- **Test box ("Ask the agent")** — `POST /api/ai/training/test`
+  takes `{workspace_id, message, subject?, from?}` (auth + workspace
+  membership required) and returns `{draft, model, provider,
+  training_used: {entries, entry_ids, chars, total_entries}, saved:
+  false, sent: false}`. The draft is shown in Settings for review
+  only: it is **never saved as a draft, never queued, and never sent**
+  — the route has no send path at all. Drafts made from the inbox /
+  compose still go through the existing review queue and the user send
+  path (`/api/send`).
+
+### Guardrails
+
+- **No credentials in training.** Every create/update (and every
+  uploaded chunk) is scanned for API keys, tokens, passwords, and
+  private-key blocks (`findSecretInText`); a match is rejected with
+  HTTP 400 `TRAINING_SECRET_REJECTED` naming the pattern — the matched
+  value is never echoed, logged, or stored. Training text itself is not
+  a secret.
+- Limits: 100 entries per workspace, 20,000 chars per entry, 50
+  entries / 200,000 chars per upload, 4,000 chars injected per prompt.
+- API: `GET /api/ai/training?workspace_id=` (list, any member);
+  `POST` (add one pasted entry, or `upload_text` + `filename`, or
+  multipart `file` + `workspace_id`; owner/admin); `PATCH` (edit,
+  re-scanned); `DELETE` (owner/admin). `GET /api/ai/status?
+  workspace_id=` additionally reports `training: {entries,
+  has_profile, updated_at}`.

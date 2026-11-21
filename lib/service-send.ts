@@ -13,6 +13,12 @@
 //     provider outcome stops the chain, marks the key `unknown`, records
 //     an outbound job for /api/ops/reconcile, and is NEVER blindly
 //     resent.
+//   - attachments: when the caller passes attachment refs, they are
+//     resolved here (ownership-scoped to this workspace + mailbox, total
+//     cap enforced) and handed to the fallback engine, so every provider
+//     attempt carries the same files. See `resolveSendAttachments`.
+//     AI auto-replies rarely carry attachments, but the service path
+//     must not drop them if present.
 //
 // Service authentication (HTTP boundary only):
 //   - Header: `Authorization: Bearer <token>` — the token is NEVER read
@@ -42,10 +48,15 @@
 import {createHash, randomUUID, timingSafeEqual} from 'node:crypto';
 import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
 import {decryptSecret} from '@/lib/crypto';
+import {kvGet} from '@/lib/kv';
 import {
   sendWithFallback,
+  MAX_ATTACHMENT_COUNT,
+  MAX_ATTACHMENT_FILE_BYTES,
+  MAX_TOTAL_ATTACHMENT_BYTES,
   type ConfiguredProvider,
   type ProviderName,
+  type SendAttachment,
 } from '@/lib/providers';
 
 export const SERVICE_AUTH_HEADER = 'authorization';
@@ -75,6 +86,154 @@ export function isServiceAuthenticated(req: Request): boolean {
   return validateServiceToken(req.headers.get(SERVICE_AUTH_HEADER));
 }
 
+// --- Attachment resolution --------------------------------------------------
+// Compose uploads a file first (POST /api/attachments, bytes in KV) and
+// the send references it. Two reference forms are accepted:
+//   1. `{attachment_id}` — a `message_attachments` row id. The row must
+//      belong to this workspace AND this mailbox; any other id (foreign
+//      tenant, or nonexistent) is 404, deliberately the same response
+//      for both, so a cross-tenant probe cannot confirm another
+//      tenant's file exists (same pattern as GET /api/messages/[id]).
+//   2. `{object_key, file_name, content_type, size_bytes}` — a file
+//      uploaded WITHOUT a message_id (the normal compose flow: the
+//      sent message does not exist yet, so no row exists to reference).
+//      Ownership is proven by the KV key prefix
+//      `att/<workspaceId>/<mailboxId>/` — the same check PATCH
+//      /api/messages/[id] `attach` uses — so a caller cannot name
+//      another tenant's bytes.
+// Caps (documented in docs/FREE-PROVIDER-QUOTAS.md "Attachments"):
+//   per file <= 25 MB (KV value cap, enforced at upload), total per
+//   message <= 10 MB, max 10 files. Over-cap is 413, before any
+//   provider is called and before the idempotency key is reserved.
+// Bytes are read from KV one file at a time and base64-encoded once;
+//   with the 10 MB total cap the peak extra memory is bounded (~14 MB
+//   base64). Attachment bytes / base64 are NEVER logged and NEVER
+//   appear in error responses — only filename + size.
+
+export interface SendAttachmentRef {
+  attachment_id?: string;
+  object_key?: string;
+  file_name?: string;
+  content_type?: string;
+  size_bytes?: number;
+}
+
+export type ResolvedAttachments =
+  | {ok: true; attachments: SendAttachment[]}
+  | {ok: false; status: number; error: string};
+
+/** Make filenames unique within one message (SendPulse's
+ *  `attachments_binary` is a filename-keyed object, so a duplicate name
+ *  would silently drop a file). `report (2).pdf`, `report (3).pdf`. */
+function uniqueFilenames(names: string[]): string[] {
+  const seen = new Map<string, number>();
+  return names.map((name) => {
+    const n = (seen.get(name) || 0) + 1;
+    seen.set(name, n);
+    if (n === 1) return name;
+    const dot = name.lastIndexOf('.');
+    return dot > 0 ? `${name.slice(0, dot)} (${n})${name.slice(dot)}` : `${name} (${n})`;
+  });
+}
+
+export async function resolveSendAttachments(
+  workspaceId: string,
+  mailboxId: string,
+  refs: SendAttachmentRef[],
+): Promise<ResolvedAttachments> {
+  // Dedupe identical refs (same row id / same object key) — a repeated
+  // entry must not send the file twice or double-count the cap.
+  const seenRef = new Set<string>();
+  const deduped = refs.filter((r) => {
+    const k = r.attachment_id ? `id:${r.attachment_id}` : `key:${r.object_key || ''}`;
+    if (seenRef.has(k)) return false;
+    seenRef.add(k);
+    return true;
+  });
+  if (deduped.length === 0) return {ok: true, attachments: []};
+  if (deduped.length > MAX_ATTACHMENT_COUNT)
+    return {ok: false, status: 413, error: `Too many attachments (max ${MAX_ATTACHMENT_COUNT} per message).`};
+
+  // Resolve the metadata for both forms into one uniform list.
+  type Meta = {fileName: string; contentType: string; sizeBytes: number; objectKey: string};
+  const metas: Meta[] = [];
+  const idRefs = deduped.filter((r) => r.attachment_id);
+  if (idRefs.length > 0) {
+    const ids = idRefs.map((r) => r.attachment_id as string);
+    const rows = await dbQuery(
+      `SELECT id, file_name, content_type, size_bytes, object_key FROM message_attachments
+       WHERE workspace_id = ? AND mailbox_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+      [workspaceId, mailboxId, ...ids],
+    );
+    const byId = new Map(rows.map((row) => [String(row.id), row]));
+    for (const r of idRefs) {
+      const row = byId.get(r.attachment_id as string);
+      // 404 for foreign AND nonexistent ids alike — never confirm
+      // whether another tenant's id exists.
+      if (!row) return {ok: false, status: 404, error: 'Attachment not found.'};
+      metas.push({
+        fileName: String(row.file_name),
+        contentType: String(row.content_type),
+        sizeBytes: Number(row.size_bytes),
+        objectKey: String(row.object_key),
+      });
+    }
+  }
+  const keyPrefix = `att/${workspaceId}/${mailboxId}/`;
+  for (const r of deduped.filter((x) => !x.attachment_id)) {
+    const key = String(r.object_key || '');
+    if (!key.startsWith(keyPrefix))
+      return {ok: false, status: 404, error: 'Attachment not found.'};
+    if (!r.file_name || r.size_bytes === undefined)
+      return {ok: false, status: 400, error: 'Attachment object_key requires file_name and size_bytes.'};
+    metas.push({
+      fileName: r.file_name,
+      contentType: r.content_type || 'application/octet-stream',
+      sizeBytes: r.size_bytes,
+      objectKey: key,
+    });
+  }
+
+  // Caps on declared sizes first (cheap rejection before any KV read).
+  let declaredTotal = 0;
+  for (const m of metas) {
+    if (!Number.isFinite(m.sizeBytes) || m.sizeBytes < 1 || m.sizeBytes > MAX_ATTACHMENT_FILE_BYTES)
+      return {ok: false, status: 413, error: 'Attachment exceeds the 25 MB per-file limit.'};
+    declaredTotal += m.sizeBytes;
+  }
+  if (declaredTotal > MAX_TOTAL_ATTACHMENT_BYTES)
+    return {ok: false, status: 413, error: 'Attachments exceed the 10 MB total limit per message.'};
+
+  // Fetch bytes one file at a time; re-check the cap against ACTUAL
+  // bytes (metadata could be stale) and stop at the first failure.
+  const names = uniqueFilenames(metas.map((m) => m.fileName));
+  const attachments: SendAttachment[] = [];
+  let actualTotal = 0;
+  for (let i = 0; i < metas.length; i++) {
+    const m = metas[i];
+    let bytes: Buffer | null;
+    try {
+      bytes = await kvGet(m.objectKey);
+    } catch {
+      return {ok: false, status: 502, error: 'Could not read attachment.'};
+    }
+    if (!bytes) return {ok: false, status: 404, error: 'Attachment bytes not found.'};
+    if (bytes.length > MAX_ATTACHMENT_FILE_BYTES)
+      return {ok: false, status: 413, error: 'Attachment exceeds the 25 MB per-file limit.'};
+    actualTotal += bytes.length;
+    if (actualTotal > MAX_TOTAL_ATTACHMENT_BYTES)
+      return {ok: false, status: 413, error: 'Attachments exceed the 10 MB total limit per message.'};
+    attachments.push({
+      filename: names[i],
+      contentType: m.contentType,
+      sizeBytes: bytes.length,
+      base64: bytes.toString('base64'),
+      objectKey: m.objectKey,
+    });
+  }
+  return {ok: true, attachments};
+}
+
 // --- Shared send execution --------------------------------------------------
 
 export interface ResolvedSender {
@@ -93,6 +252,11 @@ export interface ExecuteSendInput {
   html?: string;
   /** Caller-supplied key; when absent a fresh UUID is used. */
   idempotencyKey?: string;
+  /** Attachment refs (see `resolveSendAttachments`). Resolved before
+   *  the idempotency key is reserved, so a 404/413 never consumes it,
+   *  and included in the request hash, so reusing a key with different
+   *  attachments is a 409. */
+  attachments?: SendAttachmentRef[];
 }
 
 export interface SendActor {
@@ -184,8 +348,29 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       messageId: null,
     });
 
+  // Attachments resolve BEFORE the idempotency key is reserved: a
+  // 404 (foreign/missing id) or 413 (over cap) must not consume the
+  // key, and must not reach any provider.
+  let attachments: SendAttachment[] = [];
+  if (input.attachments?.length) {
+    const resolved = await resolveSendAttachments(input.workspaceId, sender.id, input.attachments);
+    if (!resolved.ok)
+      return finish({
+        status: resolved.status,
+        body: {error: resolved.error},
+        outcome: 'rejected',
+        provider: null,
+        providerMessageId: null,
+        messageId: null,
+      });
+    attachments = resolved.attachments;
+  }
+  const attachmentHash = (input.attachments || [])
+    .map((r) => (r.attachment_id ? `id:${r.attachment_id}` : `key:${r.object_key || ''}`))
+    .sort();
+
   const hash = createHash('sha256')
-    .update(JSON.stringify({to: input.to, subject: input.subject, text: input.text, html: input.html, mailbox: sender.id}))
+    .update(JSON.stringify({to: input.to, subject: input.subject, text: input.text, html: input.html, mailbox: sender.id, attachments: attachmentHash}))
     .digest('hex');
   const existing = await dbOne(
     'SELECT * FROM idempotency_keys WHERE workspace_id = ? AND idempotency_key = ?',
@@ -316,6 +501,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       text: input.text,
       html: input.html,
       idempotencyKey: key,
+      attachments,
     },
     configured,
   );
@@ -328,6 +514,18 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
        VALUES (?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?)`,
       [msgId, input.workspaceId, sender.id, from, input.to, input.subject, input.text || '', input.html || '', result.provider, key, now, now, now],
     );
+    // Record the attachments on the sent message so the reader shows
+    // them (GET /api/messages/[id] lists by message_id). A NEW row per
+    // file is inserted even for `{attachment_id}` refs: the original
+    // row still belongs to its draft/other message and is left alone;
+    // the KV bytes are shared (same object_key), only metadata is
+    // duplicated. Best-effort — a failure here must not fail the send.
+    for (const a of attachments) {
+      await dbRun(
+        'INSERT INTO message_attachments (id, workspace_id, mailbox_id, message_id, file_name, content_type, size_bytes, object_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [newId(), input.workspaceId, sender.id, msgId, a.filename, a.contentType, a.sizeBytes, a.objectKey, now],
+      ).catch(() => {});
+    }
     await markKey(input.workspaceId, key, 'accepted', {
       provider: result.provider,
       provider_message_id: String(result.providerMessageId || ''),
@@ -429,6 +627,9 @@ export async function executeServiceSend(input: {
   text?: string;
   html?: string;
   idempotencyKey?: string;
+  /** Passed through unchanged — the service path must not drop
+   *  attachments if an auto-reply ever carries them. */
+  attachments?: SendAttachmentRef[];
 }): Promise<SendExecution> {
   const box = await dbOne(
     'SELECT id, address, display_name, domain_id FROM mailboxes WHERE id = ? AND workspace_id = ? AND is_active = 1',
@@ -471,6 +672,7 @@ export async function executeServiceSend(input: {
       text: input.text,
       html: input.html,
       idempotencyKey: input.idempotencyKey,
+      attachments: input.attachments,
     },
     {kind: 'service', userId: null, serviceContext: SERVICE_CONTEXT_AI_AUTO_REPLY},
   );

@@ -123,3 +123,72 @@ provider's `include:` into it; never publish two `v=spf1` records.
 Attachment storage: Cloudflare KV is used. Cloudflare's card-gated
 object-storage service is NOT used — enabling it requires a card/PayPal
 on file, so it is out of this stack.
+
+## Attachments
+
+Added 21 November 2026 — this closes the compose-with-attachments gap:
+files were stored (POST `/api/attachments` → KV + `message_attachments`
+rows) but never transmitted. Attachments now travel with the send
+through the same fallback chain, with the same idempotency and
+timeout=unknown rules.
+
+### Caps
+
+| Limit | Value | Enforced where |
+|---|---|---:|
+| Per file | **25 MB** | Upload (`POST /api/attachments`); re-checked at send-resolve time |
+| Total per message (all files) | **10 MB** | Send-resolve time (`lib/service-send.ts`); over-cap is **413** before any provider is called and before the idempotency key is reserved |
+| Files per message | **10** | Request schema (`POST /api/send`, max 10 entries) and resolve time; over-count is **413** |
+
+### How a send references files
+
+`POST /api/send` accepts `attachments: [{attachment_id}]` and/or
+`[{object_key, file_name, content_type, size_bytes}]`:
+
+- `{attachment_id}` — a `message_attachments` row id. It must belong to
+  the sender's workspace **and** mailbox; any other id (foreign tenant
+  or nonexistent) is **404**, deliberately the same response for both,
+  so a cross-tenant probe cannot confirm another tenant's file exists.
+- `{object_key, ...}` — a file uploaded via `POST /api/attachments`
+  **without** a `message_id` (the normal compose flow: the sent message
+  does not exist yet, so no row exists to reference). Ownership is
+  proven by the KV key prefix `att/<workspace>/<mailbox>/` — the same
+  check `PATCH /api/messages/[id]` `attach` uses.
+
+Resolution (`resolveSendAttachments` in `lib/service-send.ts`) reads
+each file's bytes from KV one at a time, base64-encodes once, and
+re-checks the caps against the actual bytes (metadata could be stale).
+Duplicate refs are deduped; duplicate filenames are made unique
+(`report (2).pdf`) because SendPulse's field is filename-keyed. After
+an accepted send, a new `message_attachments` row per file is recorded
+against the sent message (the original row is left alone; the KV bytes
+are shared). The attachment refs are part of the idempotency request
+hash, so reusing a key with different attachments is 409; the refs
+(metadata only, never bytes) are also stored in the `outbound_jobs`
+payload so a retry can re-resolve the same files. The service path
+(AI auto-reply) passes attachments through the same way.
+
+### Per-provider encoding
+
+All four providers carry attachments — **no provider is skipped** for
+messages with attachments.
+
+| Provider | Field | Format |
+|---|---|---|
+| SendPulse | `email.attachments_binary` | `{<filename>: <base64>}` in `POST /smtp/emails`. Note: SendPulse's plain `attachments` field takes URLs only — binary content must go in `attachments_binary` or the file is silently dropped. |
+| Brevo | `attachment` | `[{name, content (base64)}]` |
+| Mailjet | `Messages[0].Attachments` | `[{ContentType, Filename, Base64Content}]` |
+| Resend | `attachments` | `[{filename, content (base64), content_type}]` |
+
+The attachment field is omitted entirely when a message has no
+attachments, so no-attachment payloads are unchanged.
+
+### Failover, logging, guardrails
+
+- Failover: the same resolved files and the same idempotency key go to
+  every provider attempt; a definite rejection falls through to the
+  next provider with attachments intact, and an unknown outcome
+  (timeout) stops the chain exactly as for attachment-free sends.
+- Logging: one `send_attachments` line per send — filename + size only.
+  Attachment bytes and base64 content are **never** logged and never
+  appear in error responses.

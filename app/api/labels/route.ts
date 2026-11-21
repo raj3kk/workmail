@@ -50,3 +50,20 @@ export async function POST(req: Request) {
   const label = await dbOne('SELECT * FROM labels WHERE id = ?', [id]);
   return NextResponse.json({label});
 }
+
+export async function DELETE(req: Request) {
+  const {user, response} = await requireUser(req);
+  if (response) return response;
+  if (!user) return NextResponse.json({error: 'Unauthorized'}, {status: 401});
+  const b = await req.json().catch(() => null);
+  if (!b?.id) return NextResponse.json({error: 'id required'}, {status: 400});
+  const label = await dbOne('SELECT workspace_id FROM labels WHERE id = ?', [b.id]);
+  if (!label) return NextResponse.json({error: 'Label not found'}, {status: 404});
+  const role = await workspaceRole(user.id, String(label.workspace_id));
+  if (!role || !['owner', 'admin'].includes(role))
+    return NextResponse.json({error: 'Workspace admin required'}, {status: 403});
+  // message_labels rows cascade via FK; delete the label itself.
+  await dbRun('DELETE FROM message_labels WHERE label_id = ?', [b.id]);
+  await dbRun('DELETE FROM labels WHERE id = ?', [b.id]);
+  return NextResponse.json({success: true});
+}

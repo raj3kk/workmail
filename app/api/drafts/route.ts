@@ -19,7 +19,7 @@ export async function GET(req: Request) {
   if (!(await canAccessMailbox(user.id, mailbox, false)))
     return NextResponse.json({error: 'Mailbox access denied'}, {status: 403});
   const drafts = await dbQuery(
-    "SELECT id, to_email, subject, text_body, updated_at FROM messages WHERE mailbox_id = ? AND folder = 'drafts' ORDER BY updated_at DESC LIMIT 100",
+    "SELECT id, to_email, subject, text_body, thread_id, in_reply_to, updated_at FROM messages WHERE mailbox_id = ? AND folder = 'drafts' ORDER BY updated_at DESC LIMIT 100",
     [mailbox],
   );
   return NextResponse.json({drafts});
@@ -42,8 +42,8 @@ export async function POST(req: Request) {
   const id = newId();
   try {
     await dbRun(
-      `INSERT INTO messages (id, workspace_id, mailbox_id, folder, from_email, to_email, subject, text_body, delivery_state, received_at, created_at, updated_at)
-       VALUES (?, ?, ?, 'drafts', ?, ?, ?, ?, 'draft', ?, ?, ?)`,
+      `INSERT INTO messages (id, workspace_id, mailbox_id, folder, from_email, to_email, subject, text_body, thread_id, in_reply_to, delivery_state, received_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'drafts', ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`,
       [
         id,
         b.workspace_id,
@@ -52,6 +52,8 @@ export async function POST(req: Request) {
         String(b.to || ''),
         String(b.subject || '').slice(0, 998),
         String(b.text || '').slice(0, 100000),
+        typeof b.thread_id === 'string' ? b.thread_id : null,
+        typeof b.in_reply_to === 'string' ? b.in_reply_to.slice(0, 998) : null,
         nowIso(),
         nowIso(),
         nowIso(),

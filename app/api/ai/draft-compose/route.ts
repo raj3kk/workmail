@@ -51,6 +51,7 @@ export async function POST(req: Request) {
         instruction: d.instruction,
         mailboxAddress: String(box.address),
       }),
+      {workspaceId: d.workspace_id, inboundText: d.instruction},
     );
     text = out.text;
     provider = String(out.config.provider);

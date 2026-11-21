@@ -49,6 +49,7 @@ export async function POST(req: Request) {
         mailboxAddress: String(box.address),
         instruction: p.data.instruction,
       }),
+      {workspaceId: String(msg.workspace_id), inboundText: String(msg.text_body || '')},
     );
     text = out.text;
     provider = String(out.config.provider);

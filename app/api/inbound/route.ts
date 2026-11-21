@@ -4,6 +4,7 @@ import {timingSafeEqual} from 'node:crypto';
 import {dbOne, dbRun, newId, nowIso} from '@/lib/db';
 import {kvPut, kvDelete} from '@/lib/kv';
 import {maybeAutoReply} from '@/lib/ai';
+import {applyMailRules} from '@/lib/filters';
 
 export const runtime = 'nodejs';
 
@@ -184,6 +185,24 @@ export async function POST(req: Request) {
   if (attachmentFailures.length > 0) {
     const note = `\n\n[WorkMail: ${attachmentFailures.length} attachment(s) failed to store: ${attachmentFailures.join('; ')}]`;
     await dbRun('UPDATE messages SET text_body = text_body || ? WHERE id = ?', [note, messageId]).catch(() => {});
+  }
+  // Mail filters (lib/filters.ts) — additive, best-effort. Enabled rules
+  // for this mailbox/workspace run against the stored message (move to
+  // folder / mark read / star / important / add labels). Never throws
+  // and never changes the 202 acceptance of the inbound message.
+  try {
+    await applyMailRules({
+      workspaceId: String(box.workspace_id),
+      mailboxId: String(box.id),
+      messageId,
+      from: d.from,
+      to: d.to.toLowerCase(),
+      subject: d.subject || '(No Subject)',
+      textBody: textBody,
+      htmlBody: d.html || '',
+    });
+  } catch {
+    // Filters must never break inbound delivery.
   }
   const period = new Date().toISOString().slice(0, 7) + '-01';
   await dbRun(

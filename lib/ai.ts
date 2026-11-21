@@ -43,8 +43,9 @@ import {createHash} from 'node:crypto';
 import {dbRun, newId, nowIso} from '@/lib/db';
 import {kvGet, kvPut} from '@/lib/kv';
 import {executeServiceSend} from '@/lib/service-send';
+import {buildTrainingContext} from '@/lib/ai-training';
 
-export const AI_PROMPT_VERSION = 'v1';
+export const AI_PROMPT_VERSION = 'v2';
 export const AI_DEFAULT_WORKERS_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 export const AI_MAX_INPUT_CHARS = 6000;
 export const AI_MAX_OUTPUT_TOKENS = 800;
@@ -117,12 +118,30 @@ const SYSTEM_PROMPT = [
   `- Prompt version: ${AI_PROMPT_VERSION}.`,
 ].join('\n');
 
+// --- Business training hook (lib/ai-training.ts) ---------------------------
+// When the caller passes a workspace id (or a pre-built training block),
+// the workspace's training is loaded and appended to the system prompt
+// as a bounded block (max AI_TRAINING_MAX_CHARS, relevance-ranked, in the
+// business's own voice). Training is workspace-scoped: only the given
+// workspace's entries are ever read. Callers that pass neither get the
+// plain base prompt — behaviour for existing callers is unchanged.
+function buildSystemPrompt(trainingContext?: string): string {
+  const block = (trainingContext || '').trim();
+  if (!block) return SYSTEM_PROMPT;
+  return (
+    SYSTEM_PROMPT +
+    '\n\n' +
+    block +
+    '\nAnswer in the business\'s voice above (tone, do\'s and don\'ts). Use only the trained facts above; if the question needs a fact not in the training, write [NEEDS HUMAN INPUT] instead of guessing.'
+  );
+}
+
 function truncate(s: string, max: number): string {
   const t = (s || '').trim();
   return t.length > max ? t.slice(0, max) + '\n[…truncated…]' : t;
 }
 
-async function callWorkersAi(cfg: AiConfig, userPrompt: string): Promise<string> {
+async function callWorkersAi(cfg: AiConfig, userPrompt: string, systemPrompt: string): Promise<string> {
   const account = process.env.CLOUDFLARE_ACCOUNT_ID || '';
   const token = process.env.CLOUDFLARE_API_TOKEN || '';
   const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/${encodeURIComponent(cfg.model)}`;
@@ -131,7 +150,7 @@ async function callWorkersAi(cfg: AiConfig, userPrompt: string): Promise<string>
     headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'},
     body: JSON.stringify({
       messages: [
-        {role: 'system', content: SYSTEM_PROMPT},
+        {role: 'system', content: systemPrompt},
         {role: 'user', content: userPrompt},
       ],
       max_tokens: AI_MAX_OUTPUT_TOKENS,
@@ -153,7 +172,7 @@ async function callWorkersAi(cfg: AiConfig, userPrompt: string): Promise<string>
   return text;
 }
 
-async function callByok(cfg: AiConfig, userPrompt: string): Promise<string> {
+async function callByok(cfg: AiConfig, userPrompt: string, systemPrompt: string): Promise<string> {
   const key = process.env.AI_PROVIDER_API_KEY || '';
   const base = (process.env.AI_PROVIDER_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
   const r = await fetch(`${base}/chat/completions`, {
@@ -162,7 +181,7 @@ async function callByok(cfg: AiConfig, userPrompt: string): Promise<string> {
     body: JSON.stringify({
       model: cfg.model,
       messages: [
-        {role: 'system', content: SYSTEM_PROMPT},
+        {role: 'system', content: systemPrompt},
         {role: 'user', content: userPrompt},
       ],
       max_tokens: AI_MAX_OUTPUT_TOKENS,
@@ -181,13 +200,56 @@ async function callByok(cfg: AiConfig, userPrompt: string): Promise<string> {
   return text;
 }
 
-/** Generate raw draft text. Throws AiNotConfiguredError / AiProviderError. Never returns fake text. */
-export async function generateDraftText(userPrompt: string): Promise<{text: string; config: AiConfig}> {
+export interface GenerateDraftOptions {
+  /** Load this workspace's training and inject it into the system prompt. */
+  workspaceId?: string;
+  /** Pre-built training block (takes precedence over loading by workspace). */
+  trainingContext?: string;
+  /** Inbound text used to rank training entries (defaults to the prompt). */
+  inboundText?: string;
+}
+
+export interface TrainingUsage {
+  /** Ids of the training entries injected (metadata only). */
+  entryIds: string[];
+  /** Characters of training text injected. */
+  chars: number;
+  /** Total training entries in the workspace. */
+  totalEntries: number;
+}
+
+/** Generate raw draft text. Throws AiNotConfiguredError / AiProviderError. Never returns fake text.
+ * When `opts.workspaceId` is given, the workspace's training is loaded
+ * and injected into the system prompt (bounded, relevance-ranked); the
+ * returned `trainingUsed` reports what was injected (metadata only). */
+export async function generateDraftText(
+  userPrompt: string,
+  opts?: GenerateDraftOptions,
+): Promise<{text: string; config: AiConfig; trainingUsed: TrainingUsage}> {
   const cfg = aiConfig();
   if (!cfg.configured) throw new AiNotConfiguredError(cfg.reason);
+  let trainingContext = opts?.trainingContext || '';
+  let trainingUsed: TrainingUsage = {entryIds: [], chars: 0, totalEntries: 0};
+  if (!trainingContext && opts?.workspaceId) {
+    try {
+      const ctx = await buildTrainingContext(opts.workspaceId, opts.inboundText ?? userPrompt);
+      trainingContext = ctx.context;
+      trainingUsed = {entryIds: ctx.usedEntryIds, chars: ctx.chars, totalEntries: ctx.totalEntries};
+    } catch {
+      // Training load failure must never break drafting: fall back to the
+      // plain base prompt (same behaviour as a workspace with no training).
+      trainingContext = '';
+      trainingUsed = {entryIds: [], chars: 0, totalEntries: 0};
+    }
+  } else if (trainingContext) {
+    trainingUsed = {entryIds: [], chars: trainingContext.length, totalEntries: 0};
+  }
+  const systemPrompt = buildSystemPrompt(trainingContext);
   const text =
-    cfg.provider === 'byok' ? await callByok(cfg, userPrompt) : await callWorkersAi(cfg, userPrompt);
-  return {text, config: cfg};
+    cfg.provider === 'byok'
+      ? await callByok(cfg, userPrompt, systemPrompt)
+      : await callWorkersAi(cfg, userPrompt, systemPrompt);
+  return {text, config: cfg, trainingUsed};
 }
 
 export function buildReplyPrompt(input: {
@@ -282,6 +344,8 @@ export async function logAiAction(entry: {
   draftId?: string | null;
   model?: string;
   provider?: string | null;
+  /** Training usage metadata only (entry ids + count — never content). */
+  training?: {count: number; entryIds: string[]};
 }): Promise<void> {
   const now = nowIso();
   const day = now.slice(0, 10);
@@ -299,6 +363,10 @@ export async function logAiAction(entry: {
       message_id: entry.messageId || null,
       draft_id: entry.draftId || null,
       actor_user_id: entry.actorUserId || null,
+      // Training usage: metadata only (entry ids + count, never content).
+      training_used: entry.training
+        ? {count: entry.training.count, entry_ids: entry.training.entryIds}
+        : null,
     });
     // Keep the log bounded: last 200 entries per workspace-day.
     const trimmed = list.slice(-200);
@@ -504,7 +572,13 @@ export async function maybeAutoReply(input: {
     const threadKey = autoReplyThreadKey(input.from, input.subject);
     const threadBlocked = (await getThreadMarker(input.mailboxId, threadKey)) !== null;
     let text: string;
+    let trainingUsed: TrainingUsage = {entryIds: [], chars: 0, totalEntries: 0};
     try {
+      // Training hook: the workspace's business training is loaded and
+      // injected into the system prompt, ranked by relevance to this
+      // inbound message — so auto-replies answer in the business's voice
+      // using its own facts. A training-load failure falls back to the
+      // plain prompt (generateDraftText handles it); drafting continues.
       const out = await generateDraftText(
         buildReplyPrompt({
           from: input.from,
@@ -512,8 +586,10 @@ export async function maybeAutoReply(input: {
           body: input.body,
           mailboxAddress: input.mailboxAddress,
         }),
+        {workspaceId: input.workspaceId, inboundText: `${input.subject}\n${input.body}`},
       );
       text = out.text;
+      trainingUsed = out.trainingUsed;
     } catch (e) {
       await logAiAction({
         action: 'ai.auto_reply_failed',
@@ -555,6 +631,7 @@ export async function maybeAutoReply(input: {
       draftId,
       model: cfg.model,
       provider: cfg.provider,
+      training: {count: trainingUsed.entryIds.length, entryIds: trainingUsed.entryIds},
     });
     if (threadBlocked) {
       // Drafted + queued for human review, but NOT transmitted: this

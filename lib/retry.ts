@@ -26,7 +26,7 @@
 //   - Jobs are claimed with `locked_at` before work starts so two
 //     concurrent reconcile ticks cannot retry the same job.
 import {dbOne, dbQuery, dbRun, nowIso, jparse} from '@/lib/db';
-import {executeSend, type ResolvedSender} from '@/lib/service-send';
+import {executeSend, type ResolvedSender, type SendAttachmentRef} from '@/lib/service-send';
 
 /** Maximum send attempts per job (initial attempt + retries). */
 export const MAX_RETRY_ATTEMPTS = 5;
@@ -53,6 +53,10 @@ export interface RetryJobPayload {
   mailboxAddress: string;
   domainId: string;
   displayName?: string | null;
+  /** Attachment refs as stored by /api/send (see lib/service-send.ts
+   *  `resolveSendAttachments`). A retried send re-resolves and re-sends
+   *  the same files; a job without attachments sends without them. */
+  attachments?: SendAttachmentRef[];
 }
 
 export interface RetrySummary {
@@ -172,6 +176,10 @@ export async function processDueOutboundJobs(limit = 25): Promise<RetrySummary> 
           text: payload.text,
           html: payload.html,
           idempotencyKey: `retry:${jobId}:${attempts + 1}`,
+          // Re-send the original attachments (re-resolved from KV by
+          // executeSend). Without this a retried send would go out
+          // without its files.
+          attachments: payload.attachments,
         },
         {kind: 'service', userId: null, serviceContext: 'ops-retry'},
       );

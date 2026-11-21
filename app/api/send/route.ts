@@ -34,6 +34,41 @@ const schema = z
     // except that the header idempotency key still takes precedence.
     service_context: z.string().max(64).optional(),
     idempotency_key: z.string().max(200).optional(),
+    // Attachments (see lib/service-send.ts `resolveSendAttachments`).
+    // Each entry is either `{attachment_id}` (a message_attachments row
+    // id belonging to the sender's workspace + mailbox) or
+    // `{object_key, file_name, content_type, size_bytes}` (a file
+    // uploaded via POST /api/attachments without a message_id — the
+    // normal compose flow). Max 10 files; total <= 10 MB and per-file
+    // <= 25 MB are enforced in the shared pipeline (413). Foreign ids
+    // are 404 — never confirmed as existing or not.
+    attachments: z
+      .array(
+        z
+          .object({
+            attachment_id: z.string().min(1).max(200).optional(),
+            object_key: z.string().min(1).max(500).optional(),
+            file_name: z.string().min(1).max(150).optional(),
+            content_type: z.string().min(1).max(255).optional(),
+            size_bytes: z
+              .number()
+              .int()
+              .positive()
+              .max(25 * 1024 * 1024)
+              .optional(),
+          })
+          .refine(
+            (x) =>
+              !!(x.attachment_id || x.object_key) &&
+              (!x.object_key || (x.file_name && x.size_bytes !== undefined)),
+            {
+              message:
+                'Each attachment needs attachment_id, or object_key with file_name and size_bytes.',
+            },
+          ),
+      )
+      .max(10)
+      .optional(),
   })
   .refine((x) => !!(x.text || x.html));
 
@@ -80,6 +115,16 @@ async function recordOutboundJob(input: {
   exec: SendExecution;
   threadId?: string;
   inReplyTo?: string;
+  // Attachment refs only (ids/keys + metadata, never bytes) so a later
+  // retry can re-resolve the same files from KV. The retry worker must
+  // pass them back through to the send pipeline.
+  attachments?: Array<{
+    attachment_id?: string;
+    object_key?: string;
+    file_name?: string;
+    content_type?: string;
+    size_bytes?: number;
+  }>;
 }): Promise<void> {
   const {exec} = input;
   if (exec.outcome === 'duplicate') return;
@@ -97,6 +142,7 @@ async function recordOutboundJob(input: {
     mailboxAddress: box ? String(box.address) : '',
     domainId: box ? String(box.domain_id) : '',
     displayName: box?.display_name ? String(box.display_name) : null,
+    attachments: input.attachments || [],
   });
   try {
     if (exec.outcome === 'unknown') {
@@ -200,6 +246,7 @@ export async function POST(req: Request) {
       text: d.text,
       html: d.html,
       idempotencyKey,
+      attachments: d.attachments,
     });
     await recordOutboundJob({
       workspaceId: d.workspace_id,
@@ -212,6 +259,7 @@ export async function POST(req: Request) {
       exec,
       threadId: d.thread_id,
       inReplyTo: d.in_reply_to,
+      attachments: d.attachments,
     });
     return NextResponse.json(exec.body, {status: exec.status});
   }
@@ -255,6 +303,7 @@ export async function POST(req: Request) {
       text: d.text,
       html: d.html,
       idempotencyKey,
+      attachments: d.attachments,
     },
     {kind: 'user', userId: user.id},
   );
@@ -269,6 +318,7 @@ export async function POST(req: Request) {
     exec,
     threadId: d.thread_id,
     inReplyTo: d.in_reply_to,
+    attachments: d.attachments,
   });
   return NextResponse.json(exec.body, {status: exec.status});
 }

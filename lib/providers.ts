@@ -29,9 +29,15 @@
 //      logged as `unconfigured` — it is never an error.
 //   6. Every attempt is logged as one structured JSON line (provider,
 //      result, latency, cap state). Secrets are never logged.
+//   7. Attachments (see "Attachments" below) travel with the send:
+//      every provider in the chain receives the same resolved files in
+//      its own encoding. Attachment bytes / base64 are NEVER logged and
+//      NEVER appear in error responses — only filename + size.
 //
 // NOTE: this module never touches the old database/object-storage stack.
-// It reads/writes D1 only.
+// It reads/writes D1 only. Attachments are stored in Cloudflare KV
+// (lib/kv.ts, key `att/<workspace>/<mailbox>/<uuid>-<safeName>`); the
+// card-gated object-storage service is NOT used.
 import {dbOne, dbRun, jstr, newId, nowIso} from '@/lib/db';
 
 export type ProviderName = 'sendpulse' | 'brevo' | 'mailjet' | 'resend';
@@ -266,6 +272,80 @@ async function recordAttemptEvent(
 }
 
 // ---------------------------------------------------------------------------
+// Attachments
+// ---------------------------------------------------------------------------
+
+/** Max total attachment bytes in one message (sum of all files). Enforced
+ *  at resolve time in lib/service-send.ts; larger sends are rejected 413
+ *  before any provider is called. Documented in
+ *  docs/FREE-PROVIDER-QUOTAS.md ("Attachments"). */
+export const MAX_TOTAL_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+/** Max files attached to one message. */
+export const MAX_ATTACHMENT_COUNT = 10;
+/** Max bytes for a single file. Matches the KV 25 MB value cap enforced
+ *  at upload (POST /api/attachments); re-checked defensively at resolve. */
+export const MAX_ATTACHMENT_FILE_BYTES = 25 * 1024 * 1024;
+
+/**
+ * One resolved attachment, ready to encode into a provider payload.
+ * `base64` is computed exactly once, at resolve time; the raw bytes are
+ * never logged and never appear in an error response — only `filename`
+ * and `sizeBytes` are safe to log. `objectKey` is the KV key the bytes
+ * were read from (needed to record the sent-message attachment rows).
+ */
+export interface SendAttachment {
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  base64: string;
+  objectKey: string;
+}
+
+/**
+ * Pure per-provider attachment encodings (exported so they can be
+ * unit-checked without any network call). Each takes already-resolved
+ * attachments and returns exactly the fragment that provider's send
+ * endpoint expects. Callers omit the fragment entirely when the list
+ * is empty, so no-attachment sends keep their previous payload shape.
+ *
+ *   Resend    `attachments: [{filename, content (base64), content_type}]`
+ *   Mailjet   `Attachments: [{ContentType, Filename, Base64Content}]`
+ *             inside Messages[0]
+ *   Brevo     `attachment: [{name, content (base64)}]`
+ *   SendPulse `attachments_binary: {<filename>: <base64>}` inside the
+ *             `email` object of POST /smtp/emails. (SendPulse's plain
+ *             `attachments` field takes URLs, NOT file bytes — binary
+ *             content must go in `attachments_binary`, or the file is
+ *             silently dropped.) All four providers carry attachments,
+ *             so no provider is skipped for messages with attachments.
+ */
+export function buildResendAttachments(atts: SendAttachment[]): Array<{
+  filename: string;
+  content: string;
+  content_type: string;
+}> {
+  return atts.map((a) => ({filename: a.filename, content: a.base64, content_type: a.contentType}));
+}
+
+export function buildMailjetAttachments(atts: SendAttachment[]): Array<{
+  ContentType: string;
+  Filename: string;
+  Base64Content: string;
+}> {
+  return atts.map((a) => ({ContentType: a.contentType, Filename: a.filename, Base64Content: a.base64}));
+}
+
+export function buildBrevoAttachments(atts: SendAttachment[]): Array<{name: string; content: string}> {
+  return atts.map((a) => ({name: a.filename, content: a.base64}));
+}
+
+export function buildSendpulseAttachmentsBinary(atts: SendAttachment[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const a of atts) out[a.filename] = a.base64;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Provider adapters
 // ---------------------------------------------------------------------------
 
@@ -328,6 +408,11 @@ export interface SendInput {
   text?: string;
   html?: string;
   idempotencyKey: string;
+  /** Resolved attachments (see "Attachments" above). The SAME list is
+   *  passed to every provider attempt in the chain, so failover never
+   *  drops a file; the per-provider encoding is applied in
+   *  sendViaProvider. Empty/undefined = no attachments. */
+  attachments?: SendAttachment[];
 }
 
 async function sendViaProvider(
@@ -365,6 +450,12 @@ async function sendViaProvider(
             to: [{email: d.to}],
             text: d.text,
             html: d.html,
+            // Binary attachments go in `attachments_binary` (filename ->
+            // base64). The plain `attachments` field takes URLs only and
+            // would silently drop file bytes. Omitted when empty.
+            ...(d.attachments?.length
+              ? {attachments_binary: buildSendpulseAttachmentsBinary(d.attachments)}
+              : {}),
           },
         }),
       });
@@ -389,6 +480,7 @@ async function sendViaProvider(
           subject: d.subject,
           textContent: d.text,
           htmlContent: d.html,
+          ...(d.attachments?.length ? {attachment: buildBrevoAttachments(d.attachments)} : {}),
         }),
       });
     } catch (e) {
@@ -416,6 +508,7 @@ async function sendViaProvider(
               TextPart: d.text,
               HTMLPart: d.html,
               CustomID: d.idempotencyKey,
+              ...(d.attachments?.length ? {Attachments: buildMailjetAttachments(d.attachments)} : {}),
             },
           ],
         }),
@@ -448,6 +541,7 @@ async function sendViaProvider(
         subject: d.subject,
         text: d.text,
         html: d.html,
+        ...(d.attachments?.length ? {attachments: buildResendAttachments(d.attachments)} : {}),
       }),
     });
   } catch (e) {
@@ -506,6 +600,21 @@ export async function sendWithFallback(
 ): Promise<FallbackOutcome> {
   const attempts: FallbackAttempt[] = [];
   const byName = new Map(configs.map((c) => [c.provider, c]));
+
+  // Attachment metadata, once per send — filename + size only. Bytes and
+  // base64 content are NEVER logged, and never appear in error responses.
+  if (input.attachments?.length) {
+    console.log(
+      JSON.stringify({
+        event: 'send_attachments',
+        workspace_id: workspaceId,
+        idempotency_key: input.idempotencyKey,
+        count: input.attachments.length,
+        total_bytes: input.attachments.reduce((n, a) => n + a.sizeBytes, 0),
+        files: input.attachments.map((a) => ({filename: a.filename, size_bytes: a.sizeBytes})),
+      }),
+    );
+  }
 
   for (const provider of PROVIDER_CHAIN) {
     const configured = byName.get(provider);
