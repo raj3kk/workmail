@@ -3909,7 +3909,7 @@ var index_default = { async email(message, env) {
       forwardedBytes += b64.length;
       attachments.push({ fileName: name, contentType: att.mimeType || "application/octet-stream", sizeBytes: size, contentBase64: b64, contentId: att.contentId || void 0, disposition: att.disposition || void 0 });
     }
-    const r = await fetch(env.WORKMAIL_API_URL + "/api/inbound", { method: "POST", headers: { "Content-Type": "application/json", "X-Inbound-Token": env.INBOUND_WEBHOOK_TOKEN }, body: JSON.stringify({ from: message.from, to: message.to, subject: mail.subject || "(No Subject)", text: mail.text || "", html: mail.html || "", messageId: mail.messageId || void 0, inReplyTo: mail.inReplyTo || void 0, references: mail.references || void 0, attachments, attachmentsSkipped: skipped, receivedAt: (/* @__PURE__ */ new Date()).toISOString() }) });
+    const r = await fetch(env.WORKMAIL_API_URL + "/api/inbound", { method: "POST", headers: { "Content-Type": "application/json", "X-Inbound-Token": env.INBOUND_WEBHOOK_TOKEN }, body: JSON.stringify({ from: mail.from && mail.from.address || message.from, replyTo: mail.replyTo && mail.replyTo.address || void 0, envelopeFrom: message.from, to: message.to, subject: mail.subject || "(No Subject)", text: mail.text || "", html: mail.html || "", messageId: mail.messageId || void 0, inReplyTo: mail.inReplyTo || void 0, references: mail.references || void 0, attachments, attachmentsSkipped: skipped, receivedAt: (/* @__PURE__ */ new Date()).toISOString() }) });
     if (!r.ok) throw Error("Inbound API " + r.status);
   } catch (e) {
     message.setReject("WorkMail inbound error: " + String(e.message || e));
