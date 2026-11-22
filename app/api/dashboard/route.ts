@@ -247,7 +247,7 @@ export async function GET(req: Request) {
     });
   } catch (e) {
     return NextResponse.json(
-      {error: e instanceof Error ? e.message : 'Could not load dashboard data'},
+      {error: 'Could not load dashboard data'},
       {status: 500},
     );
   }
