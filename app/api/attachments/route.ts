@@ -3,6 +3,7 @@ import {randomUUID} from 'node:crypto';
 import {dbOne, dbRun, newId, nowIso} from '@/lib/db';
 import {requireUser, canAccessMailbox} from '@/lib/guards';
 import {kvPut, kvGet, kvDelete} from '@/lib/kv';
+import {getEffectiveStorageBytes, getStorageLimitBytes} from '@/lib/storage';
 
 export const runtime = 'nodejs';
 
@@ -44,6 +45,21 @@ export async function POST(req: Request) {
       return NextResponse.json({error: 'File type not allowed or file exceeds 25 MB.'}, {status: 413});
     if (!(await authorized(mailboxId, user.id, workspaceId)))
       return NextResponse.json({error: 'Mailbox access denied'}, {status: 403});
+    // G-14 / G-4: per-workspace storage cap. Real stored bytes (message
+    // bodies + attachments, lib/storage.ts) vs the workspace plan limit
+    // (Free: 512 MB). Over the limit the upload is refused 413 — the
+    // file is never written to KV.
+    const [usedBytes, limitBytes] = await Promise.all([
+      getEffectiveStorageBytes(workspaceId),
+      getStorageLimitBytes(workspaceId),
+    ]).catch(() => [0, 0]);
+    if (limitBytes > 0 && usedBytes + file.size > limitBytes)
+      return NextResponse.json(
+        {
+          error: `Storage limit reached for this workspace plan (${Math.round(usedBytes / 1024 / 1024)} MB used of ${Math.round(limitBytes / 1024 / 1024)} MB). Delete old mail or attachments, or upgrade the plan.`,
+        },
+        {status: 413},
+      );
     if (messageId) {
       const m = await dbOne(
         'SELECT id, mailbox_id, workspace_id FROM messages WHERE id = ? AND mailbox_id = ? AND workspace_id = ?',
