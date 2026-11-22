@@ -53,6 +53,13 @@ export async function POST(req: Request) {
     return NextResponse.json({error: 'Admin permission required'}, {status: 403});
   const target = await dbOne('SELECT id, email FROM users WHERE email = ?', [p.data.email.toLowerCase()]);
   if (target) {
+    // The workspace owner can never be demoted through a team change
+    // (2026-11-22: an invite of the owner's own email with role
+    // 'member' overwrote the owner row and silently revoked the
+    // owner's admin rights — filters/labels/contacts all 403'd).
+    const ws = await dbOne('SELECT owner_user_id FROM workspaces WHERE id = ?', [p.data.workspace_id]);
+    if (ws && String(ws.owner_user_id) === String(target.id))
+      return NextResponse.json({error: 'The workspace owner always keeps the owner role.'}, {status: 400});
     try {
       await dbRun(
         `INSERT INTO memberships (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)
