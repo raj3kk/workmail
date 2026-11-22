@@ -186,13 +186,17 @@ async function gmailFetch(
 /** Create the WorkMail labels if they do not exist yet (import rejects unknown custom labelIds). Idempotent.
  *  Returns name -> Gmail label id (custom labels have opaque ids, NOT their names — passing a name as a
  *  labelId 400s; system labels SENT/INBOX are not in the map because their ids equal their names). */
-export async function ensureMirrorLabels(accessToken: string): Promise<Map<string, string>> {
+export async function ensureMirrorLabels(accessToken: string, extraNames: string[] = []): Promise<Map<string, string>> {
   const listed = await gmailFetch(accessToken, `${GMAIL_API}/users/me/labels`);
   const byName = new Map<string, string>();
   for (const l of (listed.json?.labels || [])) {
     if (l?.name && l?.id) byName.set(String(l.name), String(l.id));
   }
-  for (const name of ['WorkMail', 'WorkMail/Sent', 'WorkMail/Inbox']) {
+  // extraNames carries the per-mailbox labels (WorkMail/hello, …). They were
+  // NOT in this list before — every import then fell back to the label NAME
+  // as its id and Gmail 400d "Invalid label: WorkMail/hello" on all 84
+  // messages in the 2026-11-22 retest. Never pass a name as a labelId.
+  for (const name of ['WorkMail', 'WorkMail/Sent', 'WorkMail/Inbox', ...extraNames]) {
     if (byName.has(name)) continue;
     const created = await gmailFetch(accessToken, `${GMAIL_API}/users/me/labels`, {
       method: 'POST',
@@ -309,9 +313,15 @@ export async function mirrorOneMessage(
     return {outcome: 'skipped', reason};
   }
   const mime = buildMime(row as unknown as MirrorMessageRow, attachments);
-  const labelIds = mirrorLabelIds(row as unknown as MirrorMessageRow, mailboxAddress).map(
-    (name) => labelIdByName?.get(name) ?? name,
-  );
+  // Custom labels must resolve to Gmail's opaque ids — passing a NAME as a
+  // labelId 400s ("Invalid label: WorkMail/hello"). Fail here with a clear
+  // error instead of sending the name to Gmail.
+  const labelIds = mirrorLabelIds(row as unknown as MirrorMessageRow, mailboxAddress).map((name) => {
+    if (name === 'SENT' || name === 'INBOX') return name;
+    const id = labelIdByName?.get(name);
+    if (!id) throw new Error(`Gmail label not created: ${name}`);
+    return id;
+  });
   const imported = await importToGmail(accessToken, mime, labelIds);
   await dbRun(
     `INSERT INTO gmail_mirror (d1_message_id, gmail_message_id, gmail_thread_id, imported_at, status, skip_reason)
@@ -340,7 +350,11 @@ export async function mirrorAllUnmirrored(workspaceId: string, accessToken: stri
   );
   const result: MirrorRunResult = {total: rows.length, imported: 0, alreadyMirrored: 0, skipped: [], failed: []};
   if (rows.length === 0) return result;
-  const labelIdByName = await ensureMirrorLabels(accessToken);
+  const boxes = await dbQuery('SELECT address FROM mailboxes WHERE workspace_id = ?', [workspaceId]);
+  const extraNames = (boxes || []).map(
+    (b: any) => `WorkMail/${String(b.address || '').split('@')[0] || 'mailbox'}`,
+  );
+  const labelIdByName = await ensureMirrorLabels(accessToken, extraNames);
   for (const row of rows) {
     const id = String(row.id);
     const subject = String(row.subject || '(No Subject)');
@@ -422,7 +436,16 @@ export async function autoMirrorMessage(workspaceId: string, d1MessageId: string
       logMirror('gmail_mirror_auto_no_token', workspaceId, {message_id: d1MessageId});
       return false;
     }
-    const one = await mirrorOneMessage(workspaceId, accessToken, d1MessageId);
+    // Auto-mirror used to call mirrorOneMessage with NO label map at all,
+    // so every custom label fell back to its name and Gmail 400d — same
+    // "Invalid label" bug as the bulk run. Ensure this message's label first.
+    const box = await dbOne(
+      'SELECT mb.address FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id WHERE m.id = ?',
+      [d1MessageId],
+    );
+    const local = String((box as any)?.address || '').split('@')[0] || 'mailbox';
+    const labelIdByName = await ensureMirrorLabels(accessToken, [`WorkMail/${local}`]);
+    const one = await mirrorOneMessage(workspaceId, accessToken, d1MessageId, labelIdByName);
     return one.outcome === 'imported';
   } catch (e) {
     logMirror('gmail_mirror_auto_failed', workspaceId, {
