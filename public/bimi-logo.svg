@@ -2,25 +2,23 @@
 <!-- Flow99 BIMI logo — SVG Tiny 1.2, square 512x512, no scripts, no external references, no animation. -->
 <!-- New official Flow99 lockup (2026-11-22): black "Flow" + interlocking tricolor "99" ribbons -->
 <!-- (saffron / white-silver / green). BIMI forbids raster images, so the glass-ribbon render is -->
-<!-- reproduced here as flat vector shapes: three spaced "9" loops with tails. v2: wider spacing -->
-<!-- so each 9 stays readable (v1 overlapped too tightly). -->
+<!-- reproduced here as flat vector shapes. v3: the lockup has TWO 9s (not three) — saffron + green -->
+<!-- loops with a silver accent arc — because the original's ribbons weave through two digits, -->
+<!-- and three full loops could never each stay readable in 512px. -->
 <svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" viewBox="0 0 512 512" width="512" height="512">
   <title>Flow99</title>
   <rect x="0" y="0" width="512" height="512" fill="#ffffff"/>
-  <text x="28" y="290" font-family="Arial, Helvetica, sans-serif" font-size="88" font-weight="bold" fill="#161616">Flow</text>
-  <!-- back 9: silver-white ribbon -->
-  <g fill="none" stroke="#c7ccd4" stroke-width="19" stroke-linecap="round">
-    <circle cx="305" cy="228" r="38"/>
-    <path d="M 278 255 Q 260 293 237 320"/>
+  <text x="26" y="317" font-family="Arial, Helvetica, sans-serif" font-size="80" font-weight="bold" fill="#161616">Flow</text>
+  <!-- silver-white ribbon: accent arc over the two 9s -->
+  <path d="M 295 200 Q 375 155 455 200" fill="none" stroke="#c7ccd4" stroke-width="10" stroke-linecap="round"/>
+  <!-- first 9: saffron ribbon -->
+  <g fill="none" stroke="#f28c28" stroke-width="22" stroke-linecap="round">
+    <circle cx="325" cy="257" r="50"/>
+    <path d="M 290 292 Q 272 330 248 357"/>
   </g>
-  <!-- middle 9: saffron ribbon -->
-  <g fill="none" stroke="#f28c28" stroke-width="19" stroke-linecap="round">
-    <circle cx="372" cy="228" r="38"/>
-    <path d="M 345 255 Q 327 293 304 320"/>
-  </g>
-  <!-- front 9: green ribbon -->
-  <g fill="none" stroke="#1fa055" stroke-width="19" stroke-linecap="round">
-    <circle cx="439" cy="228" r="38"/>
-    <path d="M 412 255 Q 394 293 371 320"/>
+  <!-- second 9: green ribbon -->
+  <g fill="none" stroke="#1fa055" stroke-width="22" stroke-linecap="round">
+    <circle cx="430" cy="257" r="50"/>
+    <path d="M 395 292 Q 377 330 353 357"/>
   </g>
 </svg>
