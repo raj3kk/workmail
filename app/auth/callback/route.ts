@@ -21,13 +21,14 @@ const REASONS = new Set([
   'account_failed',
 ]);
 
-function logAuthFail(reason: string): void {
-  console.log(JSON.stringify({event: 'auth_callback_failed', reason}));
+function logAuthFail(reason: string, detail?: string): void {
+  // detail is a fixed category label only — never a cookie/state value.
+  console.log(JSON.stringify({event: 'auth_callback_failed', reason, ...(detail ? {detail} : {})}));
 }
 
-function errorRedirect(url: URL, reason: string): NextResponse {
+function errorRedirect(url: URL, reason: string, detail?: string): NextResponse {
   const safe = REASONS.has(reason) ? reason : 'account_failed';
-  logAuthFail(safe);
+  logAuthFail(safe, detail);
   const dest = new URL('/', url.origin);
   dest.searchParams.set('auth', 'error');
   dest.searchParams.set('reason', safe);
@@ -54,10 +55,23 @@ export async function GET(request: Request) {
   if (googleError) return errorRedirect(url, googleError === 'access_denied' ? 'access_denied' : 'google_error');
   if (!code) return errorRedirect(url, 'no_code');
   // CSRF check against the state cookie set by /api/auth/login.
+  // ROOT CAUSE 2026-11-22 (proven by Vercel log 09:37:32 IST):
+  // the ONLY callback in 09:20-09:40 failed here with state_mismatch —
+  // the check itself is unchanged (never weaken it); the detail below
+  // only tells the NEXT diagnosis which way it failed.
   const cookie = request.headers.get('cookie') || '';
   const m = cookie.match(/(?:^|;\s*)wm_oauth_state=([^;]+)/);
   const stored = m ? decodeURIComponent(m[1]) : null;
-  if (!state || !stored || state !== stored) return errorRedirect(url, 'state_mismatch');
+  if (!state || !stored || state !== stored) {
+    // cookie_missing = no wm_oauth_state cookie arrived at all: the
+    // callback landed in a different cookie jar/tab, or the cookie
+    // expired (browser drops expired cookies, so expiry looks the
+    // same as a jar split). value_mismatch = cookie present but a
+    // different value: double-click/overwrite or a stale tab.
+    // no_state_param = Google returned no state (should not happen).
+    const detail = !stored ? 'cookie_missing' : !state ? 'no_state_param' : 'value_mismatch';
+    return errorRedirect(url, 'state_mismatch', detail);
+  }
   // G-03: the callback is a GET that mints a session, so it gets the
   // D1-backed auth limiter (per client IP). A burst of code-exchange
   // attempts is throttled instead of hammering Google + D1.
