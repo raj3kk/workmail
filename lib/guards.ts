@@ -1,5 +1,5 @@
 import {NextResponse} from 'next/server';
-import {dbOne, dbQuery} from '@/lib/db';
+import {dbOne, dbQuery, dbRun, nowIso} from '@/lib/db';
 import {getSessionUser, type SessionUser} from '@/lib/auth';
 
 // Central auth guard (D1 + session cookies).
@@ -32,7 +32,27 @@ export async function requireUser(req: Request): Promise<{user: SessionUser | nu
 
 export async function requirePlatformAdmin(userId: string): Promise<boolean> {
   const row = await dbOne('SELECT user_id FROM platform_admins WHERE user_id = ?', [userId]);
-  return !!row;
+  if (row) return true;
+  // Self-heal: the bootstrap in lib/auth.ts grants platform_admins only
+  // on FIRST login, so an admin whose email was added to
+  // PLATFORM_ADMIN_EMAILS after their first login never got a row — the
+  // /admin page then said "not an admin" to a listed admin (seen live:
+  // flipify.com@gmail.com is listed and owns the workspace, yet
+  // platform_admins was empty). Honor the host env list at request time
+  // and persist the grant, so the table stays the source of truth.
+  const user = await dbOne('SELECT email FROM users WHERE id = ?', [userId]);
+  const email = user ? String(user.email || '').toLowerCase() : '';
+  if (!email) return false;
+  const list = (process.env.PLATFORM_ADMIN_EMAILS || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (!list.includes(email)) return false;
+  await dbRun('INSERT OR IGNORE INTO platform_admins (user_id, granted_at) VALUES (?, ?)', [
+    userId,
+    nowIso(),
+  ]).catch(() => {});
+  return true;
 }
 
 // Workspace role check. Returns the role string or null.
