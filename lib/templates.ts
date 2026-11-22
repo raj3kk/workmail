@@ -366,6 +366,35 @@ function wrapTemplate(opts: {
   );
 }
 
+/**
+ * Branded header for template sends (2026-11-22). The seeded defaults
+ * bake wrapTemplate's header into their stored html_body, but custom
+ * templates store plain HTML — so real template sends (compose, bulk,
+ * v1 API) went out with NO logo header while test-sends looked
+ * branded (Batch 7: the 6:20 PM "Verify Test" mail's stored html has
+ * no logo). executeSend / bulk wrap the rendered HTML with this header
+ * when it lacks one. Already-branded HTML (the defaults, which contain
+ * 'email-logo.png') is returned unchanged — never double-wrapped.
+ * Plain-text bodies are untouched; they cannot carry images.
+ */
+export function brandTemplateHtml(html: string, senderName: string): string {
+  if (!html || html.includes('email-logo.png')) return html;
+  const logo = `${appBaseUrl()}/email-logo.png`;
+  const name = senderName
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+  return (
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#1f2a5c;border-bottom:4px solid #2e4a9e;">` +
+    `<tr><td style="padding:16px 28px;"><table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>` +
+    `<td><img src="${logo}" alt="" width="44" height="44" style="display:block;border-radius:10px;" /></td>` +
+    `<td style="padding-left:14px;font-family:Arial,Helvetica,sans-serif;font-size:20px;font-weight:bold;color:#ffffff;">${name}</td>` +
+    `</tr></table></td></tr></table>` +
+    html
+  );
+}
+
 export interface DefaultTemplateSpec {
   name: string;
   category: TemplateCategory;
