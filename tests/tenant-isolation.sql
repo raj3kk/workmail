@@ -72,6 +72,8 @@ UNION ALL SELECT 'dns_change_log',
   CASE WHEN EXISTS (SELECT 1 FROM pragma_table_info('dns_change_log') WHERE name = 'workspace_id') THEN 'PASS' ELSE 'FAIL: no workspace_id column' END
 UNION ALL SELECT 'api_keys',
   CASE WHEN EXISTS (SELECT 1 FROM pragma_table_info('api_keys') WHERE name = 'workspace_id') THEN 'PASS' ELSE 'FAIL: no workspace_id column' END
+UNION ALL SELECT 'webhook_tokens',
+  CASE WHEN EXISTS (SELECT 1 FROM pragma_table_info('webhook_tokens') WHERE name = 'workspace_id') THEN 'PASS' ELSE 'FAIL: no workspace_id column' END
 UNION ALL SELECT 'api_key_rate_limits',
   CASE WHEN EXISTS (SELECT 1 FROM pragma_table_info('api_key_rate_limits') WHERE name = 'subject_key') THEN 'PASS' ELSE 'FAIL: no subject_key column' END;
 
@@ -104,7 +106,11 @@ UNION ALL SELECT 'idempotency_keys primary key',
 UNION ALL SELECT 'api_keys key_hash unique',
   CASE WHEN EXISTS (SELECT 1 FROM pragma_index_list('api_keys') WHERE "unique" = 1) THEN 'PASS' ELSE 'FAIL: no unique index on api_keys (key_hash)' END
 UNION ALL SELECT 'api_keys workspace index',
-  CASE WHEN EXISTS (SELECT 1 FROM pragma_index_list('api_keys')) THEN 'PASS' ELSE 'FAIL: no index on api_keys' END;
+  CASE WHEN EXISTS (SELECT 1 FROM pragma_index_list('api_keys')) THEN 'PASS' ELSE 'FAIL: no index on api_keys' END
+UNION ALL SELECT 'webhook_tokens token_hash unique',
+  CASE WHEN EXISTS (SELECT 1 FROM pragma_index_list('webhook_tokens') WHERE "unique" = 1) THEN 'PASS' ELSE 'FAIL: no unique index on webhook_tokens (token_hash)' END
+UNION ALL SELECT 'webhook_tokens workspace index',
+  CASE WHEN EXISTS (SELECT 1 FROM pragma_index_list('webhook_tokens')) THEN 'PASS' ELSE 'FAIL: no index on webhook_tokens' END;
 
 -- (d) API-key tenant isolation — API-level check (cannot be proven in
 -- SQL alone; the schema half above is necessary, not sufficient).
@@ -122,6 +128,21 @@ UNION ALL SELECT 'api_keys workspace index',
 -- hash, and both v1 routes scope every query to that workspace_id;
 -- lib/api-auth.ts never reads a session cookie and never accepts
 -- OPS_CRON_TOKEN.
+
+-- (e) Delivery-webhook token isolation — API-level check (cannot be
+-- proven in SQL alone; the schema half above is necessary, not
+-- sufficient). Live check (PRODUCTION-PLAN.md §9 V10, parent runs it):
+--   1. Create a webhook token in workspace A (Settings → Delivery
+--      webhook tokens).
+--   2. POST /api/delivery/webhook with A's token + A's workspace_id
+--      in the body returns 200 and records the event.
+--   3. Same call with A's token + workspace B's id in the body
+--      returns 403 and records NOTHING for B.
+--   4. The same call with the retired shared token (or no token)
+--      returns 401.
+-- Code guarantee: lib/webhook-tokens.ts resolves the workspace from
+-- the token hash, and the route compares the body workspace_id
+-- against it before touching D1.
 
 -- NOTE: this file asserts schema shape only. It does NOT test suspension,
 -- attachment-object scoping, or the API layer. Those are covered by
