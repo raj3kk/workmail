@@ -31,17 +31,18 @@ That is deliberate — this is the free, VMC-free part of BIMI only.
 
 ## The logo
 
-`public/bimi-logo.svg` — Flow99 mark, BIMI-compliant:
+`public/bimi-logo.svg` — the owner's actual Flow99 logo image itself,
+embedded as PNG (base64) inside the SVG. The owner explicitly ordered
+the real image, not a redraw ("isi ko dalo", 2026-11-22) after rejecting
+the flat-vector versions (v1–v4 rings, v5 text 9s) as bekar.
 
-- SVG Tiny 1.2 profile (`version="1.2" baseProfile="tiny"`)
-- Square canvas: `viewBox="0 0 512 512"`
-- No `<script>`, no external references, no animations, standalone valid XML
-- Design: the official Flow99 lockup (2026-11-22) — black "Flow" text
-  plus interlocking tricolor "99" ribbons (saffron / silver-white /
-  green), drawn as flat vector shapes (BIMI forbids raster images, so
-  the glass-ribbon render is a flat-vector rendition). White
-  background, readable at 32px. Replaces the old navy "99" mark, which
-  the owner retired as the wrong logo.
+**Trade-off, stated honestly:** BIMI's rulebook wants a vector drawing
+(SVG Tiny 1.2, no raster images). Embedding the PNG makes this file
+non-compliant: strict BIMI validators will reject it, and providers
+that validate strictly (some Yahoo/Fastmail paths) may then show no
+logo at all. Gmail needs a paid VMC either way. This is the owner's
+explicit choice, recorded here — if a provider ever shows no logo,
+the fix is a compliant vector drawing, not a bigger PNG.
 
 ## How to check it
 
