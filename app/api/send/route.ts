@@ -41,6 +41,12 @@ const schema = z
     // Draft row id to delete once the send is provider-accepted
     // (server-side B-c cleanup; accepted sends only).
     draft_id: z.string().min(1).max(200).optional(),
+    // Template to render server-side (lib/templates.ts). When set, the
+    // stored template supplies subject + html/text and `text`/`html`
+    // are ignored; `variables` supplies its values. Unknown variables
+    // reject the send with 400 (see lib/service-send.ts).
+    template_id: z.string().uuid().optional(),
+    variables: z.record(z.string().max(2000)).optional(),
     // Attachments (see lib/service-send.ts `resolveSendAttachments`).
     // Each entry is either `{attachment_id}` (a message_attachments row
     // id belonging to the sender's workspace + mailbox) or
@@ -77,7 +83,7 @@ const schema = z
       .max(10)
       .optional(),
   })
-  .refine((x) => !!(x.text || x.html));
+  .refine((x) => !!(x.text || x.html || x.template_id));
 
 // --- G-11: thread resolution for an outbound send ---------------------------
 // Explicit thread_id wins. Else, if in_reply_to names a message already in
@@ -142,9 +148,9 @@ async function recordOutboundJob(input: {
   ]);
   const payload = JSON.stringify({
     to: input.to,
-    subject: input.subject,
-    text: input.text || '',
-    html: input.html || '',
+    subject: input.exec.rendered?.subject ?? input.subject,
+    text: input.exec.rendered?.text ?? input.text ?? '',
+    html: input.exec.rendered?.html ?? input.html ?? '',
     mailboxId: input.mailboxId,
     mailboxAddress: box ? String(box.address) : '',
     domainId: box ? String(box.domain_id) : '',
@@ -255,6 +261,8 @@ export async function POST(req: Request) {
       idempotencyKey,
       draftId: d.draft_id,
       attachments: d.attachments,
+      templateId: d.template_id,
+      variables: d.variables,
     });
     await recordOutboundJob({
       workspaceId: d.workspace_id,
@@ -314,6 +322,8 @@ export async function POST(req: Request) {
       provider: d.provider,
       draftId: d.draft_id,
       attachments: d.attachments,
+      templateId: d.template_id,
+      variables: d.variables,
     },
     {kind: 'user', userId: user.id},
   );
