@@ -73,8 +73,8 @@ Response:
 ```json
 {
   "mailboxes": [
-    { "id": "mailbox-id-1", "address": "hello@example.com", "display_name": "Example Support" },
-    { "id": "mailbox-id-2", "address": "support@example.com", "display_name": "" }
+    { "id": "mailbox-id-1", "address": "hello@example.com", "display_name": "Example Support", "signature": "Best regards,\nExample Support" },
+    { "id": "mailbox-id-2", "address": "support@example.com", "display_name": "", "signature": "" }
   ]
 }
 ```
@@ -83,6 +83,9 @@ Response:
   listing messages.
 - `address` — the email address recipients see in the From line.
 - `display_name` — the friendly sender name (empty when none is set).
+- `signature` — the plain-text signature the server appends to every
+  send from this mailbox (empty when none is set; set it in Settings →
+  Mailbox signatures).
 
 ## POST /api/v1/send
 
@@ -235,7 +238,7 @@ Success response:
 
 Scope: `messages:read`. Header: `Authorization: Bearer wm_live_…`.
 
-Query: `?mailbox_id&limit&cursor&delivery_state&search&include_body=true`
+Query: `?mailbox_id&limit&cursor&delivery_state&search&label_id&include_body=true`
 
 ```bash
 curl "https://workmail-delta.vercel.app/api/v1/messages?limit=20&delivery_state=received" \
@@ -291,6 +294,11 @@ Response:
 - `mailbox_id` filters to one mailbox (must belong to the key's
   workspace — another workspace's ID is a 403). Omit it to see all
   mailboxes together.
+- `label_id` filters to messages carrying that label (the label must
+  belong to the key's workspace — a foreign or unknown label ID
+  returns an empty list). Label IDs are on the inbox page: open a
+  message, add a label, and the label list in Settings → Mail filters
+  shows the same labels.
 - `thread_id` / `message_id` are the threading fields: pass them back
   as `thread_id` / `in_reply_to` when replying in-thread (see the
   AI-agent flow). Both are `null` when none is recorded.
