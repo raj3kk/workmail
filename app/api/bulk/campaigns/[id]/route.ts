@@ -23,7 +23,9 @@ async function loadCampaign(req: Request, id: string) {
   const campaign = await dbOne('SELECT * FROM bulk_campaigns WHERE id = ?', [id]);
   if (!campaign) return {error: NextResponse.json({error: 'Campaign not found.'}, {status: 404})};
   const role = await workspaceRole(user.id, String(campaign.workspace_id));
-  if (!role) return {error: NextResponse.json({error: 'Workspace access denied'}, {status: 403})};
+  // P-02: 404 (not 403) on denial, so a cross-tenant campaign-id probe
+  // cannot confirm another tenant's campaign exists by the status code.
+  if (!role) return {error: NextResponse.json({error: 'Campaign not found.'}, {status: 404})};
   return {user, campaign};
 }
 
@@ -42,8 +44,13 @@ export async function GET(req: Request, {params}: {params: {id: string}}) {
     try {
       await advanceCampaign(params.id);
     } catch (err) {
-      tickError = err instanceof Error ? err.message : String(err);
-      console.error('[bulk tick]', params.id, tickError);
+      // P-04: the raw tick error can carry D1/Cloudflare internals
+      // (lib/db.ts) — it stays in the server log (console.error below)
+      // and the client gets only the controlled message. 'Campaign not
+      // found.' is the one safe tick error advanceCampaign throws.
+      const raw = err instanceof Error ? err.message : String(err);
+      tickError = raw === 'Campaign not found.' ? raw : 'Campaign tick failed. Check the server logs and retry.';
+      console.error('[bulk tick]', params.id, raw);
     }
   }
   const summary = await getBulkCampaignSummary(params.id);
