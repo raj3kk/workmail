@@ -252,6 +252,16 @@ export interface ExecuteSendInput {
   html?: string;
   /** Caller-supplied key; when absent a fresh UUID is used. */
   idempotencyKey?: string;
+  /** Manual provider pick ('auto' = fallback chain). Default 'auto'.
+   *  A manual pick is validated before any provider is called: the
+   *  workspace must have an enabled + sender-verified provider_secrets
+   *  row for it, otherwise the send is rejected with 409 and NO
+   *  attempt is made (no host-env fallback for a manual pick). */
+  provider?: 'auto' | 'sendpulse' | 'brevo' | 'mailjet' | 'resend';
+  /** Draft row id to DELETE once the send is provider-accepted
+   *  (accepted sends and duplicates-of-accepted only — never on
+   *  failed / unknown / suppressed / rejected). */
+  draftId?: string;
   /** Attachment refs (see `resolveSendAttachments`). Resolved before
    *  the idempotency key is reserved, so a 404/413 never consumes it,
    *  and included in the request hash, so reusing a key with different
@@ -304,6 +314,58 @@ async function markKey(
   await dbRun(`UPDATE idempotency_keys SET ${sets.join(', ')} WHERE workspace_id = ? AND idempotency_key = ?`, values);
 }
 
+const PROVIDER_DISPLAY: Record<ProviderName, string> = {
+  sendpulse: 'SendPulse',
+  brevo: 'Brevo',
+  mailjet: 'Mailjet',
+  resend: 'Resend',
+};
+
+/** Delete a draft row after a provider-accepted send. Returns true when
+ *  no draft row with this id remains in 'drafts' afterwards (deleted, or
+ *  already gone). Best-effort: a failure is logged, never thrown — the
+ *  send was already accepted, and the caller reports the outcome via
+ *  `draft_deleted` in the response body. */
+async function deleteDraftRow(workspaceId: string, mailboxId: string, draftId: string): Promise<boolean> {
+  try {
+    await dbRun(
+      "DELETE FROM messages WHERE id = ? AND mailbox_id = ? AND workspace_id = ? AND folder = 'drafts'",
+      [draftId, mailboxId, workspaceId],
+    );
+    const remaining = await dbOne("SELECT id FROM messages WHERE id = ? AND folder = 'drafts'", [draftId]);
+    return !remaining;
+  } catch (e) {
+    console.log(
+      JSON.stringify({
+        event: 'draft_delete_failed',
+        workspace_id: workspaceId,
+        mailbox_id: mailboxId,
+        draft_id: draftId,
+        error: e instanceof Error ? e.message : 'unknown error',
+      }),
+    );
+    return false;
+  }
+}
+
+/** Log a failed bookkeeping step on the accepted path (markKey, usage,
+ *  audit). The send was already accepted by the provider, so the step
+ *  is logged with the key / workspace / message id and the send still
+ *  returns 'accepted' — one failing bookkeeping step must never turn
+ *  an accepted send into a failure. */
+function logBookkeepingFailure(step: string, workspaceId: string, key: string, messageId: string, e: unknown): void {
+  console.log(
+    JSON.stringify({
+      event: 'send_bookkeeping_failed',
+      step,
+      workspace_id: workspaceId,
+      idempotency_key: key,
+      message_id: messageId,
+      error: e instanceof Error ? e.message : 'unknown error',
+    }),
+  );
+}
+
 /**
  * Execute one outbound send through the provider fallback engine.
  * Identical pipeline for the user-session caller and the service caller:
@@ -348,6 +410,34 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       messageId: null,
     });
 
+  // Manual provider pick (F1/F2): validate BEFORE any provider is
+  // called and before the idempotency key is reserved, so a rejected
+  // pick consumes nothing and makes NO send attempt. The workspace
+  // must have a provider_secrets row for the picked provider with
+  // enabled = 1 AND sender_verified = 1. No host-env fallback for a
+  // manual pick: a workspace that never connected the provider (or
+  // never verified its sender) gets a clear 409, never a silent send
+  // from a host key.
+  const pickedProvider =
+    input.provider && input.provider !== 'auto' ? (input.provider as ProviderName) : null;
+  if (pickedProvider) {
+    const verifiedRow = await dbOne(
+      'SELECT provider FROM provider_secrets WHERE workspace_id = ? AND provider = ? AND enabled = 1 AND sender_verified = 1',
+      [input.workspaceId, pickedProvider],
+    );
+    if (!verifiedRow)
+      return finish({
+        status: 409,
+        body: {
+          error: `${PROVIDER_DISPLAY[pickedProvider]} is not enabled and sender-verified for this workspace — pick Auto or another provider.`,
+        },
+        outcome: 'rejected',
+        provider: null,
+        providerMessageId: null,
+        messageId: null,
+      });
+  }
+
   // Attachments resolve BEFORE the idempotency key is reserved: a
   // 404 (foreign/missing id) or 413 (over cap) must not consume the
   // key, and must not reach any provider.
@@ -386,18 +476,44 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
         providerMessageId: null,
         messageId: null,
       });
-    if (existing.status === 'accepted')
+    if (existing.status === 'accepted') {
+      // Duplicate of an accepted send: the draft (if any) is deleted
+      // here too — the send already happened, so no orphan may remain.
+      let draftDeleted = true;
+      if (input.draftId) draftDeleted = await deleteDraftRow(input.workspaceId, sender.id, input.draftId);
       return finish({
         status: 200,
-        body: {success: true, duplicate: true, provider: existing.provider, messageId: existing.provider_message_id},
+        body: {
+          success: true,
+          duplicate: true,
+          provider: existing.provider,
+          messageId: existing.provider_message_id,
+          sent_message_id: existing.message_id ? String(existing.message_id) : null,
+          delivery_state: 'accepted',
+          draft_deleted: draftDeleted,
+        },
         outcome: 'duplicate',
         provider: (existing.provider as ProviderName) || null,
         providerMessageId: existing.provider_message_id ? String(existing.provider_message_id) : null,
         messageId: existing.message_id ? String(existing.message_id) : null,
       });
+    }
+    if (existing.status === 'processing' || existing.status === 'unknown')
+      return finish({
+        status: 202,
+        body: {
+          error:
+            'This send is already processing or has an unknown provider outcome. Check delivery logs before retrying.',
+          outcome: 'unknown',
+        },
+        outcome: 'unknown',
+        provider: null,
+        providerMessageId: null,
+        messageId: null,
+      });
     return finish({
       status: 409,
-      body: {error: 'This send is already processing or has an unknown provider outcome. Check delivery logs before retrying.'},
+      body: {error: 'This send request was already used and did not complete. Check delivery logs before retrying.'},
       outcome: 'rejected',
       provider: null,
       providerMessageId: null,
@@ -490,7 +606,17 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
   }
 
   const from = sender.address;
-  const name = sender.display_name || 'WorkMail';
+  const name = sender.display_name || 'Flow99';
+  // Providers the workspace explicitly disabled (enabled = 0): passed
+  // to the engine so they are skipped entirely in auto mode (B-e) —
+  // no attempt, no log, no env-fallback call.
+  const disabledRows = await dbQuery(
+    'SELECT provider FROM provider_secrets WHERE workspace_id = ? AND enabled = 0',
+    [input.workspaceId],
+  );
+  const disabledProviders = (disabledRows || [])
+    .map((r) => String(r.provider))
+    .filter((p): p is ProviderName => p === 'sendpulse' || p === 'brevo' || p === 'mailjet' || p === 'resend');
   const result = await sendWithFallback(
     input.workspaceId,
     {
@@ -504,6 +630,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       attachments,
     },
     configured,
+    {onlyProvider: pickedProvider ?? undefined, disabledProviders},
   );
 
   if (result.outcome === 'accepted') {
@@ -526,24 +653,41 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
         [newId(), input.workspaceId, sender.id, msgId, a.filename, a.contentType, a.sizeBytes, a.objectKey, now],
       ).catch(() => {});
     }
+    // The provider accepted the send: the compose draft (if any) is
+    // deleted here, server-side (B-c). Accepted only — never on
+    // failed / unknown / suppressed / rejected.
+    let draftDeleted = true;
+    if (input.draftId) draftDeleted = await deleteDraftRow(input.workspaceId, sender.id, input.draftId);
+    // Each bookkeeping step below is failure-isolated: one failing
+    // step is logged and the send still returns 'accepted' — the
+    // provider already accepted the message, so bookkeeping must
+    // never turn it into a failure (B-d).
     await markKey(input.workspaceId, key, 'accepted', {
       provider: result.provider,
       provider_message_id: String(result.providerMessageId || ''),
       message_id: msgId,
-    });
+    }).catch((e) => logBookkeepingFailure('markKey', input.workspaceId, key, msgId, e));
     await dbRun(
       `INSERT INTO usage_counters (workspace_id, period_start, sent_count, received_count, storage_bytes)
        VALUES (?, ?, 1, 0, 0)
        ON CONFLICT(workspace_id, period_start) DO UPDATE SET sent_count = usage_counters.sent_count + 1`,
       [input.workspaceId, period],
-    );
+    ).catch((e) => logBookkeepingFailure('usage_counters', input.workspaceId, key, msgId, e));
     await dbRun(
       'INSERT INTO audit_events (id, workspace_id, actor_user_id, action, target_type, target_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [newId(), input.workspaceId, actor.userId, 'email.accepted', 'message', msgId, now],
-    );
+    ).catch((e) => logBookkeepingFailure('audit_events', input.workspaceId, key, msgId, e));
     return finish({
       status: 200,
-      body: {success: true, provider: result.provider, messageId: result.providerMessageId, attempts: result.attempts},
+      body: {
+        success: true,
+        provider: result.provider,
+        messageId: result.providerMessageId,
+        sent_message_id: msgId,
+        delivery_state: 'accepted',
+        draft_deleted: draftDeleted,
+        attempts: result.attempts,
+      },
       outcome: 'accepted',
       provider: result.provider,
       providerMessageId: result.providerMessageId,
@@ -627,6 +771,10 @@ export async function executeServiceSend(input: {
   text?: string;
   html?: string;
   idempotencyKey?: string;
+  /** Draft row id to delete once the send is provider-accepted
+   *  (passed through; the service path always sends with provider
+   *  'auto' — a manual pick is never honoured here). */
+  draftId?: string;
   /** Passed through unchanged — the service path must not drop
    *  attachments if an auto-reply ever carries them. */
   attachments?: SendAttachmentRef[];
@@ -672,6 +820,8 @@ export async function executeServiceSend(input: {
       text: input.text,
       html: input.html,
       idempotencyKey: input.idempotencyKey,
+      provider: 'auto',
+      draftId: input.draftId,
       attachments: input.attachments,
     },
     {kind: 'service', userId: null, serviceContext: SERVICE_CONTEXT_AI_AUTO_REPLY},
