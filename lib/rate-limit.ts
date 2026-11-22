@@ -15,7 +15,7 @@
 // or reading for legitimate keys. The failure is logged, never thrown.
 import {dbOne, dbRun} from '@/lib/db';
 
-export type RateLimitScope = 'v1_send' | 'v1_messages' | 'api_keys_manage';
+export type RateLimitScope = 'v1_send' | 'v1_messages' | 'api_keys_manage' | 'ai_draft';
 
 export interface RateLimitOptions {
   scope: RateLimitScope;
