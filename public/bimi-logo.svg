@@ -2,24 +2,25 @@
 <!-- Flow99 BIMI logo — SVG Tiny 1.2, square 512x512, no scripts, no external references, no animation. -->
 <!-- New official Flow99 lockup (2026-11-22): black "Flow" + interlocking tricolor "99" ribbons -->
 <!-- (saffron / white-silver / green). BIMI forbids raster images, so the glass-ribbon render is -->
-<!-- reproduced here as flat vector shapes: three overlapping "9" loops with tails. -->
+<!-- reproduced here as flat vector shapes: three spaced "9" loops with tails. v2: wider spacing -->
+<!-- so each 9 stays readable (v1 overlapped too tightly). -->
 <svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" viewBox="0 0 512 512" width="512" height="512">
   <title>Flow99</title>
   <rect x="0" y="0" width="512" height="512" fill="#ffffff"/>
-  <text x="30" y="295" font-family="Arial, Helvetica, sans-serif" font-size="104" font-weight="bold" fill="#161616">Flow</text>
+  <text x="28" y="290" font-family="Arial, Helvetica, sans-serif" font-size="88" font-weight="bold" fill="#161616">Flow</text>
   <!-- back 9: silver-white ribbon -->
-  <g fill="none" stroke="#c7ccd4" stroke-width="24" stroke-linecap="round">
-    <circle cx="318" cy="232" r="46"/>
-    <path d="M 286 264 Q 266 310 240 340"/>
+  <g fill="none" stroke="#c7ccd4" stroke-width="19" stroke-linecap="round">
+    <circle cx="305" cy="228" r="38"/>
+    <path d="M 278 255 Q 260 293 237 320"/>
   </g>
   <!-- middle 9: saffron ribbon -->
-  <g fill="none" stroke="#f28c28" stroke-width="24" stroke-linecap="round">
-    <circle cx="368" cy="232" r="46"/>
-    <path d="M 336 264 Q 316 310 290 340"/>
+  <g fill="none" stroke="#f28c28" stroke-width="19" stroke-linecap="round">
+    <circle cx="372" cy="228" r="38"/>
+    <path d="M 345 255 Q 327 293 304 320"/>
   </g>
   <!-- front 9: green ribbon -->
-  <g fill="none" stroke="#1fa055" stroke-width="24" stroke-linecap="round">
-    <circle cx="418" cy="232" r="46"/>
-    <path d="M 386 264 Q 366 310 340 340"/>
+  <g fill="none" stroke="#1fa055" stroke-width="19" stroke-linecap="round">
+    <circle cx="439" cy="228" r="38"/>
+    <path d="M 412 255 Q 394 293 371 320"/>
   </g>
 </svg>
