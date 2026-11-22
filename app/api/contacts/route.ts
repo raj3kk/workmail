@@ -56,7 +56,7 @@ export async function POST(req: Request) {
       ],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not save contact'}, {status: 400});
+    return NextResponse.json({error: 'Could not save contact'}, {status: 400});
   }
   const contact = await dbOne('SELECT * FROM contacts WHERE workspace_id = ? AND email = ?', [
     b.workspace_id,
