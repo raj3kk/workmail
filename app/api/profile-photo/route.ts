@@ -36,8 +36,10 @@ export async function POST(req: Request) {
     return NextResponse.json({error: 'mailbox_id and file are required'}, {status: 400});
   const workspaceId = await mailboxWorkspace(mailboxId);
   if (!workspaceId) return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
+  // P-02: 404 (not 403) on denial, so a cross-tenant mailbox-id probe
+  // cannot confirm another tenant's mailbox exists by the status code.
   if (!(await canAccessMailbox(user.id, mailboxId, true)))
-    return NextResponse.json({error: 'Mailbox access denied'}, {status: 403});
+    return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
   let bytes: Buffer;
   try {
     bytes = Buffer.from(await file.arrayBuffer());
@@ -80,8 +82,9 @@ export async function GET(req: Request) {
   if (!mailboxId) return NextResponse.json({error: 'mailbox_id required'}, {status: 400});
   const workspaceId = await mailboxWorkspace(mailboxId);
   if (!workspaceId) return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
+  // P-02: 404 (not 403) on denial — see POST above.
   if (!(await canAccessMailbox(user.id, mailboxId, false)))
-    return NextResponse.json({error: 'Mailbox access denied'}, {status: 403});
+    return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
   let photo;
   try {
     photo = await getMailboxPhoto(workspaceId, mailboxId);
@@ -107,8 +110,10 @@ export async function DELETE(req: Request) {
   if (!mailboxId) return NextResponse.json({error: 'mailbox_id required'}, {status: 400});
   const workspaceId = await mailboxWorkspace(mailboxId);
   if (!workspaceId) return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
+  // P-02: 404 (not 403) on denial, so a cross-tenant mailbox-id probe
+  // cannot confirm another tenant's mailbox exists by the status code.
   if (!(await canAccessMailbox(user.id, mailboxId, true)))
-    return NextResponse.json({error: 'Mailbox access denied'}, {status: 403});
+    return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
   try {
     await deleteMailboxPhoto(workspaceId, mailboxId);
   } catch {
