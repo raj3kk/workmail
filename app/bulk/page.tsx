@@ -465,13 +465,13 @@ export default function BulkPage() {
                       <button onClick={() => setExcluded([])}>Select all</button>
                       <button onClick={() => setExcluded(pasteParsed.recipients.map((r) => r.email))}>Select none</button>
                     </div>
-                    <table style={{width: "100%", marginTop: 8, fontSize: 13}}><thead><tr><th align="left"></th><th align="left">Email</th><th align="left">Name</th></tr></thead>
+                    <div style={{overflowX: "auto"}}><table style={{width: "100%", marginTop: 8, fontSize: 13}}><thead><tr><th align="left"></th><th align="left">Email</th><th align="left">Name</th></tr></thead>
                       <tbody>{pasteParsed.recipients.slice(0, 50).map((r) => (
                         <tr key={r.email}>
                           <td><input type="checkbox" checked={!excluded.includes(r.email)} onChange={(e) => setExcluded((x) => e.target.checked ? x.filter((a) => a !== r.email) : [...x, r.email])} aria-label={`Include ${r.email}`} /></td>
                           <td>{r.email}</td><td>{r.name || "—"}</td>
                         </tr>
-                      ))}</tbody></table>
+                      ))}</tbody></table></div>
                     {pasteParsed.recipients.length > 50 && <small className="muted">Showing 50 of {pasteParsed.recipients.length} recipients — all {pasteParsed.recipients.length} are included unless unchecked.</small>}
                   </>
                 )}
@@ -487,8 +487,8 @@ export default function BulkPage() {
                     <b>{preview.valid_count} valid</b> · {preview.invalid.length} invalid · {preview.duplicates_removed} duplicates removed · {preview.suppressed.length} suppressed (excluded) · monthly sends left: {preview.monthly.remaining}/{preview.monthly.limit}
                     {preview.invalid.length > 0 && <div className="warn" style={{marginTop: 8}}>Invalid rows (not sent): {preview.invalid.slice(0, 5).map((x) => `row ${x.row}: ${x.email || "(blank)"} (${x.reason})`).join("; ")}{preview.invalid.length > 5 ? ` …and ${preview.invalid.length - 5} more` : ""}</div>}
                     {preview.suppressed.length > 0 && <div className="warn" style={{marginTop: 8}}>Suppressed (never emailed): {preview.suppressed.slice(0, 5).map((x) => `${x.email} (${x.reason})`).join("; ")}{preview.suppressed.length > 5 ? ` …and ${preview.suppressed.length - 5} more` : ""}</div>}
-                    <table style={{width: "100%", marginTop: 8, fontSize: 13}}><thead><tr><th align="left">Email</th><th align="left">Name</th><th align="left">Other fields</th></tr></thead>
-                      <tbody>{preview.recipients.slice(0, 10).map((r) => <tr key={r.email}><td>{r.email}</td><td>{r.name}</td><td>{Object.entries(r.fields).map(([k, v]) => `${k}=${v}`).join(", ") || "—"}</td></tr>)}</tbody></table>
+                    <div style={{overflowX: "auto"}}><table style={{width: "100%", marginTop: 8, fontSize: 13}}><thead><tr><th align="left">Email</th><th align="left">Name</th><th align="left">Other fields</th></tr></thead>
+                      <tbody>{preview.recipients.slice(0, 10).map((r) => <tr key={r.email}><td>{r.email}</td><td>{r.name}</td><td>{Object.entries(r.fields).map(([k, v]) => `${k}=${v}`).join(", ") || "—"}</td></tr>)}</tbody></table></div>
                     {preview.recipients.length > 10 && <small className="muted">Showing 10 of {preview.recipients.length} valid recipients.</small>}
                   </div>
                 )}
@@ -607,8 +607,8 @@ export default function BulkPage() {
               </div>
               {campaign.status === "sending" && <small className="muted">Sending… keep this page open; progress updates every 2 seconds.</small>}
               {recipients.length > 0 && (
-                <table style={{width: "100%", marginTop: 12, fontSize: 13}}><thead><tr><th align="left">Email</th><th align="left">Status</th><th align="left">Provider</th><th align="left">Note</th></tr></thead>
-                  <tbody>{recipients.map((r) => <tr key={r.id}><td>{r.email}</td><td>{r.status}</td><td>{r.provider || "—"}</td><td>{r.error || "—"}</td></tr>)}</tbody></table>
+                <div style={{overflowX: "auto"}}><table style={{width: "100%", marginTop: 12, fontSize: 13}}><thead><tr><th align="left">Email</th><th align="left">Status</th><th align="left">Provider</th><th align="left">Note</th></tr></thead>
+                  <tbody>{recipients.map((r) => <tr key={r.id}><td>{r.email}</td><td>{r.status}</td><td>{r.provider || "—"}</td><td>{r.error || "—"}</td></tr>)}</tbody></table></div>
               )}
             </section>
           )}
