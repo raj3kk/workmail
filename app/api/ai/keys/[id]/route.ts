@@ -29,8 +29,10 @@ export async function PATCH(req: Request, {params}: {params: {id: string}}) {
       {status: 400},
     );
   const role = await workspaceRole(user.id, String(row.workspace_id));
+  // P-02: 404 (not 403) on denial, so a cross-tenant key-id probe
+  // cannot confirm another tenant's AI key exists by the status code.
   if (role !== 'owner' && role !== 'admin')
-    return NextResponse.json({error: 'Only workspace owners and admins can change AI keys.'}, {status: 403});
+    return NextResponse.json({error: 'AI key not found'}, {status: 404});
   await dbRun('UPDATE ai_provider_keys SET model = ? WHERE id = ?', [parsed.data.model, params.id]);
   return NextResponse.json({key: {id: params.id, provider, model: parsed.data.model}});
 }
@@ -42,8 +44,9 @@ export async function DELETE(req: Request, {params}: {params: {id: string}}) {
   const row = await dbOne('SELECT id, workspace_id FROM ai_provider_keys WHERE id = ?', [params.id]);
   if (!row) return NextResponse.json({error: 'AI key not found'}, {status: 404});
   const role = await workspaceRole(user.id, String(row.workspace_id));
+  // P-02: 404 (not 403) on denial — see PATCH above.
   if (role !== 'owner' && role !== 'admin')
-    return NextResponse.json({error: 'Only workspace owners and admins can delete AI keys.'}, {status: 403});
+    return NextResponse.json({error: 'AI key not found'}, {status: 404});
   await dbRun('DELETE FROM ai_provider_keys WHERE id = ?', [params.id]);
   return NextResponse.json({deleted: true});
 }
