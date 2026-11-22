@@ -30,8 +30,10 @@ export async function POST(req: Request) {
   const d = await dbOne('SELECT id, workspace_id, domain FROM domains WHERE id = ?', [b.domain_id]);
   if (!d) return NextResponse.json({error: 'Domain not found'}, {status: 404});
   const role = await workspaceRole(user.id, d.workspace_id);
+  // P-02: 404 (not 403) on denial, so a cross-tenant domain-id probe
+  // cannot confirm another tenant's domain exists by the status code.
   if (!role || !['owner', 'admin'].includes(role))
-    return NextResponse.json({error: 'Workspace admin required'}, {status: 403});
+    return NextResponse.json({error: 'Domain not found'}, {status: 404});
   const selectors = (Array.isArray(b.dkim_selectors) ? b.dkim_selectors : ['default', 'google', 'selector1', 'selector2'])
     .map((s: string) => String(s).trim())
     .filter((s: string) => /^[\w-]{1,63}$/.test(s))
@@ -81,8 +83,10 @@ export async function PUT(req: Request) {
   );
   if (!d) return NextResponse.json({error: 'Domain not found'}, {status: 404});
   const role = await workspaceRole(user.id, d.workspace_id);
+  // P-02: 404 (not 403) on denial, so a cross-tenant domain-id probe
+  // cannot confirm another tenant's domain exists by the status code.
   if (!role || !['owner', 'admin'].includes(role))
-    return NextResponse.json({error: 'Workspace admin required'}, {status: 403});
+    return NextResponse.json({error: 'Domain not found'}, {status: 404});
   // G-15: prefer the DNS-scoped token (Zone DNS Write, flow99.in zone
   // only); fall back to the broad host token until the scoped token's
   // env var is set. See docs/SECURITY.md.
