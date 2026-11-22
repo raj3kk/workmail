@@ -98,3 +98,35 @@ export function newSessionToken(): string {
 }
 
 export {timingSafeEqual, createHash};
+
+// --- MFA secrets at rest (G-09) --------------------------------------------
+// `users.mfa_secret` and `users.pending_mfa_secret` are encrypted with
+// the same AES-256-GCM envelope as provider credentials
+// (lib/crypto.ts, key PROVIDER_CREDENTIAL_ENCRYPTION_KEY) — never
+// plaintext in D1. The enrolled secret was plaintext before this
+// change, so reads tolerate legacy rows: decryptMfaSecret returns a
+// legacy plaintext value as-is, and callers re-encrypt it on the next
+// successful verification (migrate-on-use; see
+// app/api/auth/mfa/verify/route.ts). A stored value is recognisably
+// encrypted when it has the three-part iv.tag.data shape; base32
+// secrets never contain '.', so the test cannot misfire.
+import {decryptSecret, encryptSecret} from '@/lib/crypto';
+
+export function encryptMfaSecret(secret: string): string {
+  return encryptSecret(secret);
+}
+
+export function isEncryptedMfaSecret(stored: string): boolean {
+  return stored.split('.').length === 3;
+}
+
+export function decryptMfaSecret(stored: string | null): string | null {
+  if (!stored) return null;
+  if (!isEncryptedMfaSecret(stored)) return stored; // legacy plaintext row
+  try {
+    return decryptSecret(stored);
+  } catch {
+    // Corrupt ciphertext: treat as unusable, never crash the caller.
+    return null;
+  }
+}
