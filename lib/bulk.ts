@@ -33,14 +33,31 @@
 //   - A send whose provider outcome is `unknown` (timeout) is recorded
 //     as `unknown` and NEVER blindly resent; reconciliation is via the
 //     delivery webhook / /api/ops/reconcile, same as single sends.
+//     An executeSend outcome of `rejected` whose error says the key is
+//     "already processing or has an unknown provider outcome" is also
+//     recorded as `unknown`, never `failed` (the send may already have
+//     happened; only the provider log can settle it).
+//   - Concurrency (RULE 0: no status is ever assumed): a tick first
+//     claims the campaign (tick_owner/tick_until lease, released at
+//     tick end) and then claims EACH recipient row (claimed_at) before
+//     touching it. A claim is won only while the row is still
+//     `pending` and unclaimed (or the claim is older than 10 minutes —
+//     stale-claim recovery for a tick that crashed mid-recipient).
+//     Every recipient write is guarded (status='pending' AND the
+//     claim token): 0 changes means another tick already decided the
+//     row, so the tick re-reads it, writes nothing and counts nothing.
+//     Campaign counts are NEVER incremented in memory — they come
+//     only from getBulkCampaignSummary's GROUP BY on bulk_recipients.
+//     There is intentionally no in-memory count-increment helper.
 //   - If every provider is capped (or unconfigured, or the monthly
 //     workspace limit is hit) the campaign pauses cleanly as
 //     `paused_caps` with a `pause_reason`; the pending recipient that
 //     triggered the pause stays `pending` and a resume picks it up.
 import {createHash} from 'node:crypto';
 import {inflateRawSync} from 'node:zlib';
-import {dbOne, dbQuery, dbRun, jparse, jstr, nowIso} from '@/lib/db';
+import {dbOne, dbQuery, dbRun, jparse, jstr, newId, nowIso} from '@/lib/db';
 import {executeSend} from '@/lib/service-send';
+import type {ExecuteSendInput} from '@/lib/service-send';
 import {isSuppressed} from '@/lib/providers';
 
 /** Free-tier per-campaign recipient cap. Enforced in code (parse + create) and documented in docs/BULK-MESSAGING.md. */
@@ -464,6 +481,8 @@ export interface BulkCampaignSummary {
   name: string;
   subject: string;
   status: string;
+  /** 'auto' (fallback chain) or one provider name; stored on the campaign row, carried to executeSend. */
+  provider: string;
   total_recipients: number;
   sent: number;
   failed: number;
@@ -492,6 +511,7 @@ export async function getBulkCampaignSummary(campaignId: string): Promise<BulkCa
     name: String(c.name || ''),
     subject: String(c.subject || ''),
     status: String(c.status),
+    provider: typeof c.provider === 'string' && c.provider ? String(c.provider) : 'auto',
     total_recipients: Number(c.total_recipients),
     sent: byStatus['sent'] || 0,
     failed: byStatus['failed'] || 0,
@@ -505,6 +525,22 @@ export async function getBulkCampaignSummary(campaignId: string): Promise<BulkCa
   };
 }
 
+// ---------------------------------------------------------------------------
+// Guarded recipient writes + claims (RULE 0). See the module header.
+// ---------------------------------------------------------------------------
+
+/** A claim older than this with status still 'pending' may be re-claimed by a later tick. */
+export const BULK_STALE_CLAIM_MS = 10 * 60 * 1000;
+/** Campaign-level tick lease length. A tick that runs longer than this may be overlapped by the next tick — the per-recipient claim still protects every row. */
+export const BULK_TICK_LEASE_MS = 180 * 1000;
+
+/**
+ * Guarded recipient write: applies ONLY while the row is still
+ * `pending` (and, when a claim token is given, still owned by this
+ * tick). Returns true when the write applied. On 0 changes another
+ * tick already decided the row: the row is re-read for the log, and
+ * NOTHING is written or counted by this tick.
+ */
 async function setRecipient(
   recipientId: string,
   patch: {
@@ -515,24 +551,80 @@ async function setRecipient(
     error?: string | null;
     sent_at?: string | null;
   },
-): Promise<void> {
-  await dbRun(
-    `UPDATE bulk_recipients SET status = ?, provider = ?, provider_message_id = ?, message_id = ?, error = ?, sent_at = ?, attempts = attempts + 1, updated_at = ? WHERE id = ?`,
-    [
-      patch.status,
-      patch.provider ?? null,
-      patch.provider_message_id ?? null,
-      patch.message_id ?? null,
-      patch.error ?? null,
-      patch.sent_at ?? null,
-      nowIso(),
-      recipientId,
-    ],
-  );
+  claimToken?: string | null,
+): Promise<boolean> {
+  const params: unknown[] = [
+    patch.status,
+    patch.provider ?? null,
+    patch.provider_message_id ?? null,
+    patch.message_id ?? null,
+    patch.error ?? null,
+    patch.sent_at ?? null,
+    nowIso(),
+  ];
+  let sql =
+    `UPDATE bulk_recipients SET status = ?, provider = ?, provider_message_id = ?, message_id = ?, error = ?, sent_at = ?, attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'pending'`;
+  params.push(recipientId);
+  if (claimToken) {
+    sql += ' AND claimed_at = ?';
+    params.push(claimToken);
+  }
+  const res = await dbRun(sql, params);
+  if (res.changes === 1) return true;
+  const current = await dbOne('SELECT status FROM bulk_recipients WHERE id = ?', [recipientId]).catch(() => null);
+  console.warn('[bulk] setRecipient skipped: row already decided by another tick', {
+    recipientId,
+    wanted: patch.status,
+    currentStatus: current?.status ?? null,
+  });
+  return false;
 }
 
-async function bumpCampaignCount(campaignId: string, field: 'sent_count' | 'failed_count' | 'skipped_count' | 'unknown_count'): Promise<void> {
-  await dbRun(`UPDATE bulk_campaigns SET ${field} = ${field} + 1, updated_at = ? WHERE id = ?`, [nowIso(), campaignId]);
+/**
+ * Claim one recipient row for this tick. Wins only while the row is
+ * still `pending` and unclaimed, or its claim is older than
+ * BULK_STALE_CLAIM_MS (a previous tick crashed mid-recipient).
+ * Returns true only when this tick now owns the row.
+ */
+async function claimRecipient(recipientId: string, claimToken: string): Promise<boolean> {
+  const staleBefore = new Date(Date.now() - BULK_STALE_CLAIM_MS).toISOString();
+  const res = await dbRun(
+    `UPDATE bulk_recipients SET claimed_at = ?, updated_at = ? WHERE id = ? AND status = 'pending' AND (claimed_at IS NULL OR claimed_at < ?)`,
+    [claimToken, nowIso(), recipientId, staleBefore],
+  );
+  return res.changes === 1;
+}
+
+/** Release this tick's claim on a row it did NOT decide (pause path), so a resume can claim it immediately instead of waiting out the 10-minute staleness window. */
+async function releaseClaim(recipientId: string, claimToken: string): Promise<void> {
+  await dbRun(
+    `UPDATE bulk_recipients SET claimed_at = NULL, updated_at = ? WHERE id = ? AND claimed_at = ?`,
+    [nowIso(), recipientId, claimToken],
+  ).catch(() => {});
+}
+
+/**
+ * Claim the campaign-level tick lease. Returns the lease owner token
+ * when this tick won it, or null when another tick already holds a
+ * live lease (or the campaign is no longer `sending`). A losing tick
+ * processes nothing and just returns the last-known summary.
+ */
+async function claimTick(campaignId: string): Promise<string | null> {
+  const owner = newId();
+  const until = new Date(Date.now() + BULK_TICK_LEASE_MS).toISOString();
+  const res = await dbRun(
+    `UPDATE bulk_campaigns SET tick_owner = ?, tick_until = ?, updated_at = ? WHERE id = ? AND status = 'sending' AND (tick_until IS NULL OR tick_until < ?)`,
+    [owner, until, nowIso(), campaignId, nowIso()],
+  );
+  return res.changes === 1 ? owner : null;
+}
+
+/** Release the tick lease, but only if this tick still owns it. Never throws. */
+async function releaseTick(campaignId: string, owner: string): Promise<void> {
+  await dbRun(
+    `UPDATE bulk_campaigns SET tick_owner = NULL, tick_until = NULL, updated_at = ? WHERE id = ? AND tick_owner = ?`,
+    [nowIso(), campaignId, owner],
+  ).catch(() => {});
 }
 
 async function pauseCampaign(campaignId: string, reason: string): Promise<void> {
@@ -557,9 +649,16 @@ async function finishCampaignIfDone(campaignId: string): Promise<void> {
 
 /**
  * Process up to `maxRecipients` pending recipients of a `sending`
- * campaign. No-op (returns the current summary) for any other status.
- * The campaign row is re-read before every recipient so a stop request
- * halts sending promptly. See the module header for the tick model.
+ * campaign. No-op (returns the current summary) for any other status,
+ * or when another tick already holds the campaign lease. The campaign
+ * row is re-read before every recipient so a stop request halts
+ * sending promptly. See the module header for the tick model.
+ *
+ * Per-recipient failure isolation: EACH recipient iteration is wrapped
+ * in try/catch. A throw (executeSend, D1, anything) records that
+ * recipient as `unknown` through the guarded write and the tick
+ * continues with the next recipient — one bad row never aborts the
+ * tick or skips finishCampaignIfDone.
  */
 export async function advanceCampaign(
   campaignId: string,
@@ -572,6 +671,26 @@ export async function advanceCampaign(
     if (!summary) throw new Error('Campaign not found.');
     return summary;
   }
+  // Campaign-level tick lease (belt-and-braces over the per-recipient
+  // claim). A losing tick processes nothing.
+  const tickOwner = await claimTick(campaignId);
+  if (!tickOwner) {
+    const summary = await getBulkCampaignSummary(campaignId);
+    if (!summary) throw new Error('Campaign not found.');
+    return summary;
+  }
+  try {
+    return await advanceCampaignClaimed(campaign, maxRecipients);
+  } finally {
+    await releaseTick(campaignId, tickOwner);
+  }
+}
+
+async function advanceCampaignClaimed(
+  campaign: Record<string, unknown>,
+  maxRecipients: number,
+): Promise<BulkCampaignSummary> {
+  const campaignId = String(campaign.id);
   const sender = await dbOne(
     'SELECT id, address, display_name, domain_id FROM mailboxes WHERE id = ? AND workspace_id = ?',
     [campaign.mailbox_id, campaign.workspace_id],
@@ -595,29 +714,52 @@ export async function advanceCampaign(
     if (!summary) throw new Error('Campaign not found.');
     return summary;
   }
+  // Campaign provider choice: 'auto' = fallback chain, or one provider
+  // name = ONLY that provider (no silent fallback — enforced in the
+  // send engine, which validates a manual pick before calling any
+  // provider). Carried verbatim to executeSend. Any unexpected stored
+  // value falls back to 'auto' rather than inventing a provider.
+  const campaignProvider: 'auto' | 'sendpulse' | 'brevo' | 'mailjet' | 'resend' =
+    campaign.provider === 'sendpulse' ||
+    campaign.provider === 'brevo' ||
+    campaign.provider === 'mailjet' ||
+    campaign.provider === 'resend'
+      ? campaign.provider
+      : 'auto';
   for (const rec of recipients) {
     // Stop check before every recipient — the stop route flips this row.
     const live = await dbOne('SELECT status FROM bulk_campaigns WHERE id = ?', [campaignId]);
     if (!live || live.status !== 'sending') break;
-    const email = String(rec.email);
-    const recipient: ParsedRecipient = {
-      email,
-      name: String(rec.name || ''),
-      fields: jparse<Record<string, string>>(String(rec.fields || '{}'), {}),
-      row: 0,
-    };
-    // Suppression re-check right before the send (defence in depth).
-    const suppression = await isSuppressed(String(campaign.workspace_id), email);
-    if (suppression.suppressed) {
-      await setRecipient(String(rec.id), {status: 'skipped', error: `Suppressed (${suppression.reason || 'suppressed'}).`});
-      await bumpCampaignCount(campaignId, 'skipped_count');
-      continue;
-    }
-    const subject = renderTemplate(String(campaign.subject || ''), recipient);
-    const text = renderTemplate(String(campaign.text_body || ''), recipient);
-    const html = renderTemplate(String(campaign.html_body || ''), recipient);
-    const exec = await executeSend(
-      {
+    const recipientId = String(rec.id);
+    const claimToken = newId();
+    try {
+      // Per-recipient claim: a lost claim means another tick owns or
+      // already decided this row — skip it, decide nothing.
+      if (!(await claimRecipient(recipientId, claimToken))) continue;
+      const email = String(rec.email);
+      const recipient: ParsedRecipient = {
+        email,
+        name: String(rec.name || ''),
+        fields: jparse<Record<string, string>>(String(rec.fields || '{}'), {}),
+        row: 0,
+      };
+      // Suppression re-check right before the send (defence in depth).
+      const suppression = await isSuppressed(String(campaign.workspace_id), email);
+      if (suppression.suppressed) {
+        await setRecipient(
+          recipientId,
+          {status: 'skipped', error: `Suppressed (${suppression.reason || 'suppressed'}).`},
+          claimToken,
+        );
+        continue;
+      }
+      const subject = renderTemplate(String(campaign.subject || ''), recipient);
+      const text = renderTemplate(String(campaign.text_body || ''), recipient);
+      const html = renderTemplate(String(campaign.html_body || ''), recipient);
+      // executeSend's `provider` input ('auto' = fallback chain, or a
+      // single provider name). The send engine validates a manual pick
+      // (enabled + sender-verified) before calling any provider.
+      const sendInput: ExecuteSendInput = {
         workspaceId: String(campaign.workspace_id),
         sender: {
           id: String(sender.id),
@@ -630,69 +772,128 @@ export async function advanceCampaign(
         text: text || undefined,
         html: html || undefined,
         idempotencyKey: String(rec.idempotency_key),
-      },
-      {kind: 'user', userId: campaign.created_by ? String(campaign.created_by) : null},
-    );
-    const attempts = Array.isArray((exec.body as {attempts?: unknown[]}).attempts)
-      ? ((exec.body as {attempts: Array<{result?: string}>}).attempts)
-      : [];
-    if (exec.outcome === 'accepted' || exec.outcome === 'duplicate') {
-      // `duplicate` = the same key+content was already accepted (e.g. a
-      // crash between accept and marking the row). It is a sent mail,
-      // not a second delivery.
-      await setRecipient(String(rec.id), {
-        status: 'sent',
-        provider: exec.provider,
-        provider_message_id: exec.providerMessageId,
-        message_id: exec.messageId,
-        sent_at: nowIso(),
+        provider: campaignProvider,
+      };
+      const exec = await executeSend(sendInput, {
+        kind: 'user',
+        userId: campaign.created_by ? String(campaign.created_by) : null,
       });
-      await bumpCampaignCount(campaignId, 'sent_count');
-      continue;
-    }
-    if (exec.outcome === 'unknown') {
-      await setRecipient(String(rec.id), {
-        status: 'unknown',
-        provider: exec.provider,
-        error: 'Provider outcome unknown after timeout. Do not resend until provider logs are checked.',
-      });
-      await bumpCampaignCount(campaignId, 'unknown_count');
-      continue;
-    }
-    if (exec.outcome === 'suppressed') {
-      await setRecipient(String(rec.id), {status: 'skipped', error: 'Recipient is on the workspace suppression list.'});
-      await bumpCampaignCount(campaignId, 'skipped_count');
-      continue;
-    }
-    if (exec.outcome === 'failed') {
-      const allCapped = attempts.length > 0 && attempts.every((a) => a.result === 'cap_exhausted');
-      const allUnconfigured = attempts.length > 0 && attempts.every((a) => a.result === 'unconfigured');
-      if (allCapped) {
-        // Clean pause: the triggering recipient stays `pending` and a
-        // resume picks it up once a cap window frees.
-        await pauseCampaign(campaignId, 'provider_caps: all providers are at their free-tier caps. Resume after a cap window resets.');
+      const attempts = Array.isArray((exec.body as {attempts?: unknown[]}).attempts)
+        ? ((exec.body as {attempts: Array<{result?: string}>}).attempts)
+        : [];
+      if (exec.outcome === 'accepted' || exec.outcome === 'duplicate') {
+        // `duplicate` = the same key+content was already accepted (e.g. a
+        // crash between accept and marking the row). It is a sent mail,
+        // not a second delivery.
+        await setRecipient(
+          recipientId,
+          {
+            status: 'sent',
+            provider: exec.provider,
+            provider_message_id: exec.providerMessageId,
+            message_id: exec.messageId,
+            sent_at: nowIso(),
+          },
+          claimToken,
+        );
+        continue;
+      }
+      if (exec.outcome === 'unknown') {
+        await setRecipient(
+          recipientId,
+          {
+            status: 'unknown',
+            provider: exec.provider,
+            error: 'Provider outcome unknown after timeout. Do not resend until provider logs are checked.',
+          },
+          claimToken,
+        );
+        continue;
+      }
+      if (exec.outcome === 'suppressed') {
+        await setRecipient(
+          recipientId,
+          {status: 'skipped', error: 'Recipient is on the workspace suppression list.'},
+          claimToken,
+        );
+        continue;
+      }
+      if (exec.outcome === 'failed') {
+        const allCapped = attempts.length > 0 && attempts.every((a) => a.result === 'cap_exhausted');
+        const allUnconfigured = attempts.length > 0 && attempts.every((a) => a.result === 'unconfigured');
+        if (allCapped) {
+          // Clean pause: the triggering recipient stays `pending` and a
+          // resume picks it up once a cap window frees. Release its
+          // claim so the resume can claim it immediately.
+          await releaseClaim(recipientId, claimToken);
+          await pauseCampaign(campaignId, 'provider_caps: all providers are at their free-tier caps. Resume after a cap window resets.');
+          break;
+        }
+        if (allUnconfigured) {
+          await releaseClaim(recipientId, claimToken);
+          await pauseCampaign(campaignId, 'no_providers_configured: no provider in the fallback chain has credentials. Connect a provider, then resume.');
+          break;
+        }
+        await setRecipient(
+          recipientId,
+          {
+            status: 'failed',
+            error: 'All configured providers rejected the send.',
+          },
+          claimToken,
+        );
+        continue;
+      }
+      // 'rejected': monthly limit pauses the campaign; a key stuck at
+      // 'processing'/'unknown' is `unknown`, never `failed`; anything
+      // else is a per-recipient failure (bad domain, …).
+      const errText = typeof exec.body?.error === 'string' ? exec.body.error : 'Send rejected.';
+      if (errText.includes('Monthly sending limit')) {
+        await releaseClaim(recipientId, claimToken);
+        await pauseCampaign(campaignId, 'monthly_limit: the workspace monthly sending limit was reached. Resume next month (or after a limit increase).');
         break;
       }
-      if (allUnconfigured) {
-        await pauseCampaign(campaignId, 'no_providers_configured: no provider in the fallback chain has credentials. Connect a provider, then resume.');
-        break;
+      if (errText.includes('already processing or has an unknown provider outcome')) {
+        await setRecipient(
+          recipientId,
+          {
+            status: 'unknown',
+            provider: exec.provider,
+            error: 'Send already processing or has an unknown provider outcome. Do not resend until provider logs are checked.',
+          },
+          claimToken,
+        );
+        continue;
       }
-      await setRecipient(String(rec.id), {
-        status: 'failed',
-        error: 'All configured providers rejected the send.',
+      await setRecipient(recipientId, {status: 'failed', error: errText}, claimToken);
+    } catch (err) {
+      // One recipient's failure never aborts the tick. Record it as
+      // `unknown` (no provider outcome was established) through the
+      // guarded write, then continue with the next recipient.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[bulk] recipient tick error — recorded as unknown', {
+        campaignId,
+        recipientId,
+        error: message,
       });
-      await bumpCampaignCount(campaignId, 'failed_count');
+      try {
+        await setRecipient(
+          recipientId,
+          {
+            status: 'unknown',
+            error: `Tick failed before a provider outcome was recorded: ${message}. Do not resend until provider logs are checked.`,
+          },
+          claimToken,
+        );
+      } catch (writeErr) {
+        console.error('[bulk] could not record unknown status for recipient', {
+          campaignId,
+          recipientId,
+          error: writeErr instanceof Error ? writeErr.message : String(writeErr),
+        });
+      }
       continue;
     }
-    // 'rejected': monthly limit pauses the campaign; anything else is a
-    // per-recipient failure (bad domain, idempotency conflict, …).
-    const errText = typeof exec.body?.error === 'string' ? exec.body.error : 'Send rejected.';
-    if (errText.includes('Monthly sending limit')) {
-      await pauseCampaign(campaignId, 'monthly_limit: the workspace monthly sending limit was reached. Resume next month (or after a limit increase).');
-      break;
-    }
-    await setRecipient(String(rec.id), {status: 'failed', error: errText});
-    await bumpCampaignCount(campaignId, 'failed_count');
   }
   await finishCampaignIfDone(campaignId);
   const summary = await getBulkCampaignSummary(campaignId);
