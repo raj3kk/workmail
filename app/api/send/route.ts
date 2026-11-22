@@ -228,10 +228,9 @@ async function recordOutboundJob(input: {
 // Per decision D5 the branch dies rather than being kept "just in
 // case". OPS_CRON_TOKEN still authenticates the ops routes
 // (/api/ops/monitor, /api/ops/reconcile) — those are untouched.
-// NOTE: lib/service-send.ts still exports validateServiceToken /
-// executeServiceSend / SERVICE_CONTEXT_AI_AUTO_REPLY for the
-// in-process AI caller; the HTTP validation half is now dead code
-// owned by that file — Phase 3b / the coordinator may remove it.
+// NOTE: lib/service-send.ts still exports executeServiceSend /
+// SERVICE_CONTEXT_AI_AUTO_REPLY for the in-process AI caller; the HTTP
+// validation half (validateServiceToken) was removed at merge.
 export async function POST(req: Request) {
   if (!isValidOrigin(req))
     return NextResponse.json({error: 'Invalid origin'}, {status: 403});
