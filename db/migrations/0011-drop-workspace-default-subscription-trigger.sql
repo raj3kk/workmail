@@ -1,0 +1,16 @@
+-- Migration 0011: drop the workspace_default_subscription trigger.
+-- ROOT CAUSE (2026-11-22): the trigger auto-created a 'free'/'active'
+-- subscription on every workspace INSERT, while lib/auth.ts
+-- upsertGoogleUser ALSO inserts the subscription explicitly. The second
+-- insert violated the partial unique index subscriptions_one_active_idx
+-- (one active subscription per workspace), so EVERY new-user signup
+-- failed with auth_callback_failed reason account_failed — while the
+-- existing user (flipify) kept working, because the existing-user path
+-- (ensureUserWorkspace) SELECTs first and only inserts when missing.
+-- The trigger arrived on live D1 with the 2026-11-22 ~09:40 IST schema
+-- re-apply; it was not there when flipify signed up on 2026-11-21.
+-- The explicit insert in upsertGoogleUser is now the single owner of
+-- the subscription row. This migration was already applied to live D1
+-- (DROP TRIGGER, verified: the trigger is gone, and the exact 5-insert
+-- signup chain was re-run against live D1 and passed).
+DROP TRIGGER IF EXISTS workspace_default_subscription;
