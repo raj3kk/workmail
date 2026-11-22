@@ -441,6 +441,19 @@ export interface SendInput {
   headers?: Record<string, string>;
 }
 
+/** Read a bounded, whitespace-collapsed slice of a failed provider response.
+ *  Provider validation messages (e.g. SendPulse's 422 "sender not verified")
+ *  live ONLY in the body — without this, D1 records a bare status code and the
+ *  real reason is unrecoverable. Never throws; returns '' when unreadable. */
+async function providerErrorDetail(r: Response): Promise<string> {
+  try {
+    const t = (await r.text()).replace(/\s+/g, ' ').trim().slice(0, 500);
+    return t ? `: ${t}` : '';
+  } catch {
+    return '';
+  }
+}
+
 async function sendViaProvider(
   provider: ProviderName,
   secret: ProviderSecret,
@@ -491,7 +504,7 @@ async function sendViaProvider(
         throw new UnknownOutcomeError('SendPulse send timed out or connection dropped; outcome unknown');
       throw e;
     }
-    if (!r.ok) throw new Error(`SendPulse HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`SendPulse HTTP ${r.status}${await providerErrorDetail(r)}`);
     const body = (await r.json().catch(() => null)) as {id?: string; messageId?: string} | null;
     return {providerMessageId: body?.id || body?.messageId || null, httpStatus: r.status};
   }
@@ -516,7 +529,7 @@ async function sendViaProvider(
         throw new UnknownOutcomeError('Brevo send timed out or connection dropped; outcome unknown');
       throw e;
     }
-    if (!r.ok) throw new Error(`Brevo HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`Brevo HTTP ${r.status}${await providerErrorDetail(r)}`);
     const body = (await r.json().catch(() => null)) as {messageId?: string} | null;
     return {providerMessageId: body?.messageId || null, httpStatus: r.status};
   }
@@ -547,7 +560,7 @@ async function sendViaProvider(
         throw new UnknownOutcomeError('Mailjet send timed out or connection dropped; outcome unknown');
       throw e;
     }
-    if (!r.ok) throw new Error(`Mailjet HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`Mailjet HTTP ${r.status}${await providerErrorDetail(r)}`);
     const body = (await r.json().catch(() => null)) as {
       Messages?: Array<{To?: Array<{MessageID?: number}>}>;
     } | null;
@@ -579,7 +592,7 @@ async function sendViaProvider(
       throw new UnknownOutcomeError('Resend send timed out or connection dropped; outcome unknown');
     throw e;
   }
-  if (!r.ok) throw new Error(`Resend HTTP ${r.status}`);
+  if (!r.ok) throw new Error(`Resend HTTP ${r.status}${await providerErrorDetail(r)}`);
   const body = (await r.json().catch(() => null)) as {id?: string} | null;
   return {providerMessageId: body?.id || null, httpStatus: r.status};
 }
@@ -930,7 +943,7 @@ export async function sendWithFallback(
     } catch (e) {
       const latency = Date.now() - started;
       const kind = classifySendError(e);
-      const reason = e instanceof Error ? e.message.slice(0, 200) : 'Provider error';
+      const reason = e instanceof Error ? e.message.slice(0, 500) : 'Provider error';
       if (kind === 'unknown') {
         // TIMEOUT / DROPPED CONNECTION: outcome unknown. Stop the chain
         // NOW. Do not try the next provider, do not mark failed, do not
