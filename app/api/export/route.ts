@@ -68,7 +68,7 @@ export async function POST(req: Request) {
     if (e instanceof ExportTooLargeError)
       return NextResponse.json({error: e.message}, {status: 413});
     return NextResponse.json(
-      {error: e instanceof Error ? e.message : 'Could not build export'},
+      {error: 'Could not build export'},
       {status: 500},
     );
   }
