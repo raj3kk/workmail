@@ -40,7 +40,7 @@ export async function PATCH(req: Request) {
       [b.workspace_id, b.plan, LIMITS[b.plan], now],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not change plan'}, {status: 400});
+    return NextResponse.json({error: 'Could not change plan'}, {status: 400});
   }
   const after = {plan: b.plan, monthly_send_limit: LIMITS[b.plan]};
   await dbRun(
