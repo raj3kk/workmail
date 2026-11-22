@@ -143,7 +143,8 @@ console.log(res.status, data);`}</pre>
       <p>
         Scope: <code>send</code>. The send runs through the same pipeline as the WorkMail
         inbox: monthly workspace cap, suppression list, idempotency, per-provider caps, and
-        automatic fallback across your configured providers. The response is honest:{" "}
+        automatic fallback across your configured providers (Auto chain: Brevo → Mailjet →
+        Resend; SendPulse is manual-only). The response is honest:{" "}
         <code>success: true</code> only when a provider accepted the message.
       </p>
       <p><b>curl:</b></p>
@@ -608,7 +609,7 @@ if (inbound) {
           <tr>
             <td style={td}>SendPulse (free plan)</td>
             <td style={td}>50 per hour, 400 per day, 1 MB max message size</td>
-            <td style={td}>Auto mode falls through to the next provider; a manual SendPulse pick is rejected once capped.</td>
+            <td style={td}>Manual-only — never tried by Auto. A manual pick is rejected with 409 if the From mailbox is not a verified SendPulse sender, or once capped.</td>
           </tr>
           <tr>
             <td style={td}>Brevo (free plan)</td>
