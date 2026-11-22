@@ -19,7 +19,6 @@ import {getGmailAccessToken, getGmailMirrorTokenRow} from '@/lib/gmail-oauth';
 export const GMAIL_IMPORT_MAX_BYTES = 150 * 1024 * 1024;
 
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1';
-const GMAIL_UPLOAD_API = 'https://gmail.googleapis.com/upload/gmail/v1';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -184,30 +183,41 @@ async function gmailFetch(
   return {status: r.status, json, retryAfterMs: retryAfter ? Number(retryAfter) * 1000 : null};
 }
 
-/** Create the WorkMail labels if they do not exist yet (import rejects unknown custom labelIds). Idempotent. */
-export async function ensureMirrorLabels(accessToken: string): Promise<void> {
+/** Create the WorkMail labels if they do not exist yet (import rejects unknown custom labelIds). Idempotent.
+ *  Returns name -> Gmail label id (custom labels have opaque ids, NOT their names — passing a name as a
+ *  labelId 400s; system labels SENT/INBOX are not in the map because their ids equal their names). */
+export async function ensureMirrorLabels(accessToken: string): Promise<Map<string, string>> {
   const listed = await gmailFetch(accessToken, `${GMAIL_API}/users/me/labels`);
-  const existing = new Set<string>((listed.json?.labels || []).map((l: any) => String(l.name)));
+  const byName = new Map<string, string>();
+  for (const l of (listed.json?.labels || [])) {
+    if (l?.name && l?.id) byName.set(String(l.name), String(l.id));
+  }
   for (const name of ['WorkMail', 'WorkMail/Sent', 'WorkMail/Inbox']) {
-    if (existing.has(name)) continue;
+    if (byName.has(name)) continue;
     const created = await gmailFetch(accessToken, `${GMAIL_API}/users/me/labels`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name, labelListVisibility: 'labelShow', messageListVisibility: 'show'}),
     });
-    if (created.status !== 200) {
+    if (created.status === 200 && created.json?.id) {
+      byName.set(name, String(created.json.id));
+    } else {
       logMirror('gmail_mirror_label_create_failed', '', {label: name, http_status: created.status});
     }
   }
+  return byName;
 }
 
-/** Import one MIME document with backoff on 429 / 5xx (max 4 attempts). Returns the Gmail message + thread ids. */
+/** Import one MIME document with backoff on 429 / 5xx (max 4 attempts). Returns the Gmail message + thread ids.
+ *  Uses the STANDARD messages.import endpoint (JSON body {raw, labelIds}) — the /upload/ media endpoint
+ *  only accepts message/rfc822 bytes and rejects application/json ("Media type 'application/json' is
+ *  not supported"), which broke every import on 2026-11-22. */
 export async function importToGmail(
   accessToken: string,
   rawMime: string,
   labelIds: string[],
 ): Promise<{gmailMessageId: string; gmailThreadId: string | null}> {
-  const url = `${GMAIL_UPLOAD_API}/users/me/messages/import?internalDateSource=dateHeader&neverMarkSpam=true`;
+  const url = `${GMAIL_API}/users/me/messages/import?internalDateSource=dateHeader&neverMarkSpam=true`;
   const body = JSON.stringify({raw: base64url(rawMime), labelIds});
   let lastError = 'Gmail import failed';
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -269,11 +279,14 @@ async function recordSkipped(d1MessageId: string, reason: string): Promise<void>
   );
 }
 
-/** Mirror one D1 message. Already-mapped rows are a no-op (idempotent). Oversize messages are recorded as skipped with a reason, never attempted. */
+/** Mirror one D1 message. Already-mapped rows are a no-op (idempotent). Oversize messages are recorded as skipped with a reason, never attempted.
+ *  labelIdByName maps custom label NAMES to their Gmail label ids (see ensureMirrorLabels); system
+ *  labels (SENT/INBOX) pass through unchanged because their ids equal their names. */
 export async function mirrorOneMessage(
   workspaceId: string,
   accessToken: string,
   d1MessageId: string,
+  labelIdByName?: Map<string, string>,
 ): Promise<MirrorOneResult> {
   const existing = await dbOne('SELECT status, gmail_message_id FROM gmail_mirror WHERE d1_message_id = ?', [d1MessageId]);
   if (existing?.status === 'imported') return {outcome: 'imported', alreadyMirrored: true, gmailMessageId: String(existing.gmail_message_id || '')};
@@ -296,7 +309,9 @@ export async function mirrorOneMessage(
     return {outcome: 'skipped', reason};
   }
   const mime = buildMime(row as unknown as MirrorMessageRow, attachments);
-  const labelIds = mirrorLabelIds(row as unknown as MirrorMessageRow, mailboxAddress);
+  const labelIds = mirrorLabelIds(row as unknown as MirrorMessageRow, mailboxAddress).map(
+    (name) => labelIdByName?.get(name) ?? name,
+  );
   const imported = await importToGmail(accessToken, mime, labelIds);
   await dbRun(
     `INSERT INTO gmail_mirror (d1_message_id, gmail_message_id, gmail_thread_id, imported_at, status, skip_reason)
@@ -325,12 +340,12 @@ export async function mirrorAllUnmirrored(workspaceId: string, accessToken: stri
   );
   const result: MirrorRunResult = {total: rows.length, imported: 0, alreadyMirrored: 0, skipped: [], failed: []};
   if (rows.length === 0) return result;
-  await ensureMirrorLabels(accessToken);
+  const labelIdByName = await ensureMirrorLabels(accessToken);
   for (const row of rows) {
     const id = String(row.id);
     const subject = String(row.subject || '(No Subject)');
     try {
-      const one = await mirrorOneMessage(workspaceId, accessToken, id);
+      const one = await mirrorOneMessage(workspaceId, accessToken, id, labelIdByName);
       if (one.outcome === 'imported') {
         if (one.alreadyMirrored) result.alreadyMirrored++;
         else result.imported++;
