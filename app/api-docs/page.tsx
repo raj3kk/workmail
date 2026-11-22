@@ -127,8 +127,8 @@ console.log(res.status, data);`}</pre>
       <p>Successful response:</p>
       <pre style={pre}>{`{
   "mailboxes": [
-    { "id": "mailbox-id-1", "address": "hello@example.com", "display_name": "Example Support" },
-    { "id": "mailbox-id-2", "address": "support@example.com", "display_name": "" }
+    { "id": "mailbox-id-1", "address": "hello@example.com", "display_name": "Example Support", "signature": "Best regards,\\nExample Support" },
+    { "id": "mailbox-id-2", "address": "support@example.com", "display_name": "", "signature": "" }
   ]
 }`}</pre>
       <p>What each field means:</p>
@@ -136,6 +136,7 @@ console.log(res.status, data);`}</pre>
         <li><code>id</code> — the mailbox ID. Pass it as <code>mailbox_id</code> when sending or listing messages.</li>
         <li><code>address</code> — the email address, for example <code>hello@example.com</code>. This is what recipients see in the From line.</li>
         <li><code>display_name</code> — the friendly sender name shown next to the address (empty when none is set).</li>
+        <li><code>signature</code> — the plain-text signature the server appends to every send from this mailbox (empty when none is set; set it in Settings → Mailbox signatures).</li>
       </ul>
 
       <h2 style={h2}>4. Send an email — POST /api/v1/send</h2>
@@ -420,6 +421,10 @@ console.log(res.status, data);
           <tr>
             <td style={td}><code>search</code></td>
             <td style={td}>Search text — matches the subject, sender, and recipient.</td>
+          </tr>
+          <tr>
+            <td style={td}><code>label_id</code></td>
+            <td style={td}>Show only messages carrying this label (the label must belong to your workspace — a foreign or unknown label ID returns an empty list).</td>
           </tr>
           <tr>
             <td style={td}><code>include_body=true</code></td>
