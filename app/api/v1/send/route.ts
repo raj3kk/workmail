@@ -105,7 +105,11 @@ const attachmentBase64Schema = z.object({
 const schema = z
   .object({
     to: z.string().email(),
-    subject: z.string().min(1).max(998),
+    // Subject is optional when template_id is set: the stored template
+    // supplies it (docs/API.md). Without a template, the refine below
+    // requires it. A template-only call used to fail validation here
+    // with "subject Required" before the template was ever read.
+    subject: z.string().min(1).max(998).optional(),
     text: z.string().max(100000).optional(),
     html: z.string().max(200000).optional(),
     template_id: z.string().uuid().optional(),
@@ -117,7 +121,12 @@ const schema = z
     idempotency_key: z.string().max(200).optional(),
     attachments: z.array(z.union([attachmentRefSchema, attachmentBase64Schema])).max(10).optional(),
   })
-  .refine((x) => !!(x.text || x.html || x.template_id));
+  .refine((x) => !!(x.text || x.html || x.template_id), {
+    message: 'Provide text, html, or template_id.',
+  })
+  .refine((x) => !!x.subject || !!x.template_id, {
+    message: 'Provide subject, or template_id (the template supplies the subject).',
+  });
 
 type Base64AttachmentInput = z.infer<typeof attachmentBase64Schema>;
 
@@ -329,6 +338,11 @@ export async function POST(req: Request) {
   if (!parsed.success)
     return NextResponse.json({error: 'Invalid message', details: parsed.error.flatten()}, {status: 400});
   const d = parsed.data;
+  // The template supplies the subject when template_id is set (the
+  // refine above guarantees a subject otherwise). executeSend overwrites
+  // this from the rendered template before any use, so '' here is only
+  // a type-level placeholder, never sent or stored.
+  const subject = d.subject ?? '';
 
   // Resolve the sender mailbox: explicit id must belong to this
   // workspace and be active (foreign/nonexistent ids get the same
@@ -376,7 +390,7 @@ export async function POST(req: Request) {
         domain_id: String(box.domain_id),
       },
       to: d.to,
-      subject: d.subject,
+      subject,
       text: d.text,
       html: d.html,
       idempotencyKey,
@@ -400,7 +414,7 @@ export async function POST(req: Request) {
     workspaceId: key.workspaceId,
     mailboxId: String(box.id),
     to: d.to,
-    subject: d.subject,
+    subject,
     text: d.text,
     html: d.html,
     idempotencyKey,
