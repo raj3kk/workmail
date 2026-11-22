@@ -77,14 +77,27 @@ export async function PATCH(req: Request) {
     return NextResponse.json({error: 'invoice_id and payment_reference required'}, {status: 400});
   if (!(await requirePlatformAdmin(user.id)))
     return NextResponse.json({error: 'Platform admin only'}, {status: 403});
-  const invoice = await dbOne('SELECT id, subscription_id, workspace_id, status FROM invoices WHERE id = ?', [b.invoice_id]);
+  const invoice = await dbOne('SELECT id, subscription_id, workspace_id, status, metadata FROM invoices WHERE id = ?', [b.invoice_id]);
   if (!invoice || invoice.status !== 'pending')
     return NextResponse.json({error: 'Pending invoice not found'}, {status: 404});
+  // G-16: evidence/notes for the payment (e.g. UPI reference, receipt
+  // note). Stored on the invoice metadata and written into the
+  // admin_actions detail so the confirmation is auditable.
+  const evidence = typeof b.evidence === 'string' ? b.evidence.trim().slice(0, 2000) : typeof b.notes === 'string' ? b.notes.trim().slice(0, 2000) : '';
   const now = nowIso();
-  await dbRun('UPDATE invoices SET status = ?, payment_reference = ?, paid_at = ? WHERE id = ?', [
+  const existingMeta = (() => {
+    try {
+      return JSON.parse(String(invoice.metadata || '{}')) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  })();
+  if (evidence) existingMeta.evidence = evidence;
+  await dbRun('UPDATE invoices SET status = ?, payment_reference = ?, paid_at = ?, metadata = ? WHERE id = ?', [
     'paid',
     String(b.payment_reference).slice(0, 200),
     now,
+    jstr(existingMeta),
     invoice.id,
   ]);
   if (invoice.subscription_id)
@@ -104,7 +117,7 @@ export async function PATCH(req: Request) {
   }
   await dbRun(
     'INSERT INTO admin_actions (id, admin_user_id, action, target_workspace_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-    [newId(), user.id, 'billing.invoice_paid', invoice.workspace_id, jstr({invoice_id: invoice.id, payment_reference: b.payment_reference}), now],
+    [newId(), user.id, 'billing.invoice_paid', invoice.workspace_id, jstr({invoice_id: invoice.id, payment_reference: b.payment_reference, ...(evidence ? {evidence} : {})}), now],
   );
   return NextResponse.json({success: true, activated: true});
 }
