@@ -578,3 +578,305 @@ ALTER TABLE bulk_recipients ADD COLUMN claimed_at TEXT;
 ALTER TABLE bulk_campaigns ADD COLUMN tick_owner TEXT;
 ALTER TABLE bulk_campaigns ADD COLUMN tick_until TEXT;
 ALTER TABLE bulk_campaigns ADD COLUMN provider TEXT NOT NULL DEFAULT 'auto';
+
+-- ==========================================================================
+-- MERGE (coordinator 2026-11-22): migrations 0001-0008 appended in number
+-- order. Live D1 already has all of these applied; this file is the
+-- canonical schema definition for a fresh database.
+-- ==========================================================================
+
+-- --- db/migrations/0001_email_templates.sql ---
+-- WorkMail Phase 1 — email templates (2026-11-22) — ADDITIVE ONLY.
+-- Apply one statement at a time via the D1 /query endpoint (the /batch
+-- endpoint 404s on this account); see ~/workspace/workmail-audit/apply_d1.py.
+-- Do NOT edit db/schema.sql for this feature (coordinator merges at the end).
+-- Tenant isolation is enforced in application code (membership checks in
+-- every /api/templates route); D1 has no row-level security.
+-- Seeded defaults are created by lib/templates.ts ensureDefaultTemplates()
+-- on first Templates visit, not by this migration (no signup-path change).
+
+CREATE TABLE IF NOT EXISTS email_templates (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL CHECK (category IN ('auth', 'welcome', 'notification', 'newsletter', 'transactional')),
+  subject TEXT NOT NULL DEFAULT '',
+  html_body TEXT NOT NULL DEFAULT '',
+  text_body TEXT NOT NULL DEFAULT '',
+  variables TEXT NOT NULL DEFAULT '[]',
+  is_default INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS email_templates_workspace_idx ON email_templates(workspace_id, category);
+CREATE UNIQUE INDEX IF NOT EXISTS email_templates_one_default_idx ON email_templates(workspace_id, category) WHERE is_default = 1;
+ALTER TABLE bulk_campaigns ADD COLUMN template_id TEXT;
+
+-- --- db/migrations/0002_api_keys.sql ---
+-- WorkMail Phase 2 — Integration API keys (migration 0002).
+--
+-- Table `api_keys`: per-workspace, hashed, scoped, revocable API keys
+-- for the public v1 API (POST /api/v1/send, GET /api/v1/messages).
+-- Only the SHA-256 hash is stored; the plaintext key (wm_live_...) is
+-- shown ONCE at creation and is never stored, logged, or returned by
+-- any GET. See PRODUCTION-PLAN.md §5 / decision D4.
+--
+-- Table `api_key_rate_limits`: D1-backed per-key sliding-window
+-- counters used by lib/rate-limit.ts for the v1 routes (decision D7:
+-- D1-backed, not KV-backed, not in-memory-only). Phase 3a extends
+-- lib/rate-limit.ts for other scopes; it must NOT drop or rename this
+-- table — its own migration (0003) creates its tables with
+-- CREATE TABLE IF NOT EXISTS.
+--
+-- Apply one statement at a time via the D1 /query endpoint
+-- (the /batch endpoint 404s on this account).
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT '',
+  key_prefix TEXT NOT NULL,
+  key_hash TEXT NOT NULL,
+  scopes TEXT NOT NULL DEFAULT '["send"]',
+  created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  last_used_at TEXT,
+  expires_at TEXT,
+  revoked_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS api_keys_key_hash_unique ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS api_keys_workspace_idx ON api_keys(workspace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS api_key_rate_limits (
+  scope TEXT NOT NULL,
+  subject_key TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (scope, subject_key, window_start)
+);
+
+-- --- db/migrations/0003_security.sql ---
+-- WorkMail Phase 3a — Security hardening (migration 0003).
+--
+-- Table `webhook_tokens`: per-workspace delivery-webhook tokens (G-01,
+-- decision D6). The old single shared DELIVERY_WEBHOOK_TOKEN is retired:
+-- the delivery webhook now derives the workspace from the token and
+-- rejects a mismatched workspace_id in the body, so a token from
+-- workspace A can never write delivery events for workspace B.
+--   - Format: `wm_hook_<43 base64url chars>` (32 random bytes).
+--     The full token is shown ONCE at creation; only its SHA-256 hash
+--     is stored in `webhook_tokens.token_hash`. No GET ever returns a
+--     token value. Same shape as `api_keys` (Phase 2, decision D4) but
+--     a separate table, so the v1 key surface stays clean.
+--   - One token is scoped to exactly one workspace. Rotate = create a
+--     new token + revoke the old one. Revoke = instant.
+--
+-- MFA lockout (G-04) reuses the existing `api_key_rate_limits` table
+-- (migration 0002) with scope 'mfa' — see lib/rate-limit.ts
+-- recordFailure/failureCount/clearFailures. No new table needed.
+--
+-- Apply one statement at a time via the D1 /query endpoint
+-- (the /batch endpoint 404s on this account).
+
+CREATE TABLE IF NOT EXISTS webhook_tokens (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT '',
+  token_prefix TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  last_used_at TEXT,
+  expires_at TEXT,
+  revoked_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS webhook_tokens_token_hash_unique ON webhook_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS webhook_tokens_workspace_idx ON webhook_tokens(workspace_id, created_at DESC);
+
+-- --- db/migrations/0004_data.sql ---
+-- WorkMail Phase 3b — data, limits, backup/export, retention (migration 0004).
+--
+-- Apply one statement at a time via the D1 /query endpoint (the /batch
+-- endpoint 404s on this account); see ~/workspace/workmail-audit/apply_d1.py.
+-- Do NOT edit db/schema.sql for this feature (coordinator merges at the end).
+--
+-- Contents:
+--   1. delivery_events.event_type gains 'unconfigured' (G5a). SQLite cannot
+--      ALTER a CHECK, so the table is recreated (same columns + UNIQUE,
+--      new CHECK), data copied, old table dropped, new table renamed.
+--      Backfill: the 12 live rows with event_type='unknown' whose
+--      details.result='unconfigured' become 'unconfigured' (verified
+--      2026-11-22: all 12 unknown rows are unconfigured attempts; true
+--      timeouts = 0). Rows whose details say anything else stay 'unknown'.
+--   2. workspace_settings.allow_host_provider_fallback (G-14): 0 by default.
+--      Workspaces with no provider row may NOT fall back to host env keys
+--      unless this is 1. The live owner workspace is set to 1 by a separate
+--      one-off D1 UPDATE (not in this file — the workspace id is a live
+--      environment fact, not repo content); new workspaces default to 0.
+--   3. provider_secrets.sender_attested + sender_verified_via (G-25):
+--      sender_verified stays the send-eligibility flag (so no live send
+--      breaks during the deploy window); sender_attested marks the
+--      user-asserted state and sender_verified_via ('provider' |
+--      'attested') records HOW the row became verified. Existing rows
+--      were all attestations (the old "I verified sender" button), so
+--      they backfill to attested=1, via='attested'. Only a successful
+--      "Verify now" server check sets via='provider'.
+--   4. bulk_campaigns.sent_count / failed_count backfill (G5b): derived
+--      from bulk_recipients (live: both campaigns 2/2 sent, stored 0/2
+--      and 0/0 -> both become 2/0). lib/bulk.ts keeps them in sync on
+--      every tick completion going forward.
+--   5. usage_counters.storage_bytes backfill (G4): real bytes of all
+--      messages + attachments stored so far for the workspace (live: 0
+--      after 20 messages -> real byte count). Going forward lib/service-send
+--      (send) and app/api/inbound (receive) add real bytes per message.
+--      NOTE: usage_counters is keyed by period_start (monthly), so this
+--      backfill lands on every existing row; the per-workspace quota check
+--      in lib/storage.ts derives usage from D1 directly (message bodies
+--      + attachment sizes) so it is correct regardless of period.
+--   6. Retention scope (G-32/G-33): no new columns needed — the retention
+--      route deletes by created_at from messages, message_attachments
+--      (KV keys deleted first), delivery_events, audit_events,
+--      outbound_jobs (payload column included — deleting the row deletes
+--      the payload), and idempotency_keys (accepted keys kept 90 days).
+--      retention_days already exists on workspace_settings (default 90).
+
+-- 1. delivery_events: recreate with 'unconfigured' in the CHECK.
+CREATE TABLE delivery_events_new (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  provider TEXT NOT NULL,
+  provider_event_id TEXT,
+  event_type TEXT NOT NULL CHECK (event_type IN ('accepted','sent','delivered','deferred','bounced','complained','rejected','opened','clicked','unknown','unconfigured')),
+  recipient TEXT,
+  details TEXT NOT NULL DEFAULT '{}',
+  occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (provider, provider_event_id)
+);
+INSERT INTO delivery_events_new (id, workspace_id, message_id, provider, provider_event_id, event_type, recipient, details, occurred_at, created_at)
+  SELECT id, workspace_id, message_id, provider, provider_event_id, event_type, recipient, details, occurred_at, created_at FROM delivery_events;
+DROP TABLE delivery_events;
+ALTER TABLE delivery_events_new RENAME TO delivery_events;
+UPDATE delivery_events SET event_type = 'unconfigured' WHERE event_type = 'unknown' AND json_extract(details, '$.result') = 'unconfigured';
+
+-- 2. Host provider fallback gate (G-14).
+ALTER TABLE workspace_settings ADD COLUMN allow_host_provider_fallback INTEGER NOT NULL DEFAULT 0;
+
+-- 3. Two-state sender verification (G-25).
+ALTER TABLE provider_secrets ADD COLUMN sender_attested INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_secrets ADD COLUMN sender_verified_via TEXT;
+UPDATE provider_secrets SET sender_attested = sender_verified, sender_verified_via = CASE WHEN sender_verified = 1 THEN 'attested' ELSE NULL END;
+
+-- 4. Bulk campaign counters backfill (G5b).
+UPDATE bulk_campaigns SET
+  sent_count = (SELECT COUNT(*) FROM bulk_recipients WHERE campaign_id = bulk_campaigns.id AND status = 'sent'),
+  failed_count = (SELECT COUNT(*) FROM bulk_recipients WHERE campaign_id = bulk_campaigns.id AND status = 'failed');
+
+-- 5. Storage-bytes backfill (G4).
+UPDATE usage_counters SET storage_bytes =
+  (SELECT COALESCE(SUM(LENGTH(CAST(text_body AS BLOB)) + LENGTH(CAST(html_body AS BLOB))), 0) FROM messages WHERE workspace_id = usage_counters.workspace_id)
+  + (SELECT COALESCE(SUM(size_bytes), 0) FROM message_attachments WHERE workspace_id = usage_counters.workspace_id);
+
+-- --- db/migrations/0005_gmail_mirror.sql ---
+-- Phase 4 — Gmail backup mirror (PRODUCTION-PLAN.md §7).
+-- D1 stays the source of truth; Gmail gets a labelled copy via
+-- users.messages.import. Dedupe is authoritative in gmail_mirror
+-- (Gmail search does not reliably index custom headers).
+-- Applied to live D1 one statement at a time (the /batch endpoint 404s).
+-- Do NOT edit db/schema.sql — the coordinator merges migrations at the end.
+
+CREATE TABLE IF NOT EXISTS gmail_mirror (
+  d1_message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  gmail_message_id TEXT,
+  gmail_thread_id TEXT,
+  imported_at TEXT NOT NULL DEFAULT (datetime('now')),
+  status TEXT NOT NULL DEFAULT 'imported' CHECK (status IN ('imported', 'skipped')),
+  skip_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS gmail_oauth_tokens (
+  workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  refresh_token_ciphertext TEXT NOT NULL,
+  google_email TEXT,
+  auto_mirror INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS gmail_mirror_status_idx ON gmail_mirror(status, imported_at);
+
+-- --- db/migrations/0006_ai_keys.sql ---
+-- WorkMail E4 — AI drafting BYOK keys (migration 0006).
+--
+-- Table `ai_provider_keys`: the user's OWN Gemini / Groq API keys for
+-- the "Draft with AI" helper (compose + bulk). Separate from the trained
+-- AI agent (lib/ai.ts / auto-reply / draft-reply) — drafting only.
+--
+-- Keys are stored ENCRYPTED with lib/crypto.ts AES-256-GCM +
+-- PROVIDER_CREDENTIAL_ENCRYPTION_KEY, exactly like provider
+-- credentials. Plaintext is NEVER stored, NEVER returned by any GET,
+-- NEVER put in client JS, NEVER logged. Only the last 4 characters
+-- (last4) are shown in the UI. One key per (workspace, provider);
+-- saving again replaces the stored key. The chosen model is stored
+-- per key; if it is retired, draft calls fail naming the model
+-- (no silent fallback). See PRODUCTION-PLAN.md §11.4.
+--
+-- Apply one statement at a time via the D1 /query endpoint
+-- (the /batch endpoint 404s on this account).
+
+CREATE TABLE IF NOT EXISTS ai_provider_keys (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL CHECK (provider IN ('gemini', 'groq')),
+  key_encrypted TEXT NOT NULL,
+  model TEXT NOT NULL,
+  last4 TEXT NOT NULL DEFAULT '',
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (workspace_id, provider)
+);
+CREATE INDEX IF NOT EXISTS ai_provider_keys_workspace_idx ON ai_provider_keys(workspace_id);
+
+-- --- db/migrations/0007_mailbox_signatures.sql ---
+-- WorkMail E5-10 — per-mailbox signatures (migration 0007).
+--
+-- `mailboxes.signature`: plain-text signature appended to compose
+-- sends from that mailbox (as "\n\n-- \n" + signature, text body
+-- only). NULL/empty = no signature. HTML signatures are NOT
+-- supported (documented in the Settings UI and in lib/ai-draft.ts
+-- sibling code — the compose path appends text only).
+-- Editable in Settings → Mailboxes (MailboxSignaturesSection).
+-- See PRODUCTION-PLAN.md §11.5 row E5-10.
+--
+-- Apply one statement at a time via the D1 /query endpoint
+-- (the /batch endpoint 404s on this account).
+
+ALTER TABLE mailboxes ADD COLUMN signature TEXT;
+
+-- --- db/migrations/0008_bulk_v2.sql ---
+-- WorkMail Bulk v2 (E3 + E5-5) — ADDITIVE ONLY.
+-- Apply one statement at a time via the D1 /query endpoint (the /batch
+-- endpoint 404s on this account); see ~/workspace/workmail-audit/apply_d1.py.
+-- Do NOT edit db/schema.sql for this feature (coordinator merges at the end).
+-- Renumbered from 0005: Phase 4 took 0005_gmail_mirror.sql (coordinator
+-- notice 2026-11-22 ~08:36 IST); 0006 = ai_keys, 0007 = mailbox signatures.
+-- Tenant isolation is enforced in application code (membership checks in
+-- every /api/bulk route); D1 has no row-level security.
+--
+-- personalized: 1 = per-recipient rendering ({{name}}, {{email}}, CSV
+-- columns); 0 = SAME — one identical body for everyone (creation rejects
+-- per-recipient variables in that mode). DEFAULT 1 preserves the old
+-- behaviour: every campaign created before this column existed rendered
+-- per recipient.
+-- attachments: JSON array of SendAttachmentRef objects
+--   [{object_key, file_name, content_type, size_bytes}] — one attachment
+--   set per campaign, uploaded via POST /api/attachments (KV-stored),
+--   resolved per recipient by the shared send engine (lib/service-send.ts).
+--   Caps are enforced at campaign creation in lib/bulk.ts
+--   (validateBulkAttachments): 2 MB per file, 1 MB total per message
+--   (SendPulse free-tier message-size cap).
+ALTER TABLE bulk_campaigns ADD COLUMN personalized INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE bulk_campaigns ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';
