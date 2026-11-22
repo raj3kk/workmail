@@ -114,14 +114,14 @@ export default function Home(){
  useEffect(()=>{const q=new URLSearchParams(window.location.search);if(q.get("auth")==="error"){const r=q.get("reason")||"default";setSessionError(AUTH_ERROR_MESSAGES[r]||AUTH_ERROR_MESSAGES.default);}fetch("/api/auth/session").then(r=>r.json()).then(s=>{setUser(s.user||null);const w=s.workspaces?.[0];if(w?.id)setWorkspaceId(w.id);setLoading(false);}).catch(e=>{setSessionError(e?.message||"Could not reach the server. Check your connection and try again.");setLoading(false);});},[]);
  // Toast auto-dismiss (L-08): the notice clears itself after 7s.
  useEffect(()=>{if(!notice)return;const t=setTimeout(()=>setNotice(""),7000);return ()=>clearTimeout(t);},[notice]);
- async function loadBoxes(){const r=await fetch("/api/mailboxes");const d=await r.json();setMailboxes(d.data||[]);if(!mailboxId&&d.data?.[0])setMailboxId(d.data[0].id);fetch("/api/providers").then(pr=>pr.json()).then(pd=>{if(Array.isArray(pd.providers))setProviders(pd.providers);}).catch(()=>{});}
+ async function loadBoxes(){const r=await fetch("/api/mailboxes",{cache:"no-store"});const d=await r.json();setMailboxes(d.data||[]);if(!mailboxId&&d.data?.[0])setMailboxId(d.data[0].id);fetch("/api/providers",{cache:"no-store"}).then(pr=>pr.json()).then(pd=>{if(Array.isArray(pd.providers))setProviders(pd.providers);}).catch(()=>{});}
  useEffect(()=>{if(user)loadBoxes();},[user]);
  useEffect(()=>{if(!user||!workspaceId)return;fetch(`/api/ai/status?workspace_id=${encodeURIComponent(workspaceId)}`).then(r=>r.json()).then(s=>setAiStatus(s)).catch(()=>{});},[user,workspaceId]);
  async function loadAi(){if(!mailboxId||mailboxId==="all")return;const r=await fetch(`/api/ai/auto-reply?mailbox_id=${encodeURIComponent(mailboxId)}`);const d=await r.json();if(r.ok){setAutoReply(!!d.auto_reply?.enabled);setAiQueue(d.queue||[]);}}
  useEffect(()=>{if(user&&mailboxId)loadAi();},[user,mailboxId]);
- async function loadCounts(){if(!mailboxId)return;const r=await fetch(`/api/messages?mailbox_id=${encodeURIComponent(mailboxId)}&counts=1`);const d=await r.json();if(r.ok)setCounts(d.counts||{});}
+ async function loadCounts(){if(!mailboxId)return;const r=await fetch(`/api/messages?mailbox_id=${encodeURIComponent(mailboxId)}&counts=1`,{cache:"no-store"});const d=await r.json();if(r.ok)setCounts(d.counts||{});}
  useEffect(()=>{if(user&&mailboxId)loadCounts();},[user,mailboxId]);
- async function loadLabels(){if(!workspaceId)return;const r=await fetch(`/api/labels?workspace_id=${encodeURIComponent(workspaceId)}`);const d=await r.json();if(r.ok)setLabels(d.labels||[]);}
+ async function loadLabels(){if(!workspaceId)return;const r=await fetch(`/api/labels?workspace_id=${encodeURIComponent(workspaceId)}`,{cache:"no-store"});const d=await r.json();if(r.ok)setLabels(d.labels||[]);}
  useEffect(()=>{if(workspaceId)loadLabels();},[workspaceId]);
  // Server-side search (wires /api/search into the inbox UI — L-12):
  // 2+ chars searches the whole mailbox, not just the loaded page.
@@ -139,9 +139,12 @@ export default function Home(){
    // showed "0 messages" until Refresh — the old code had already
    // cleared the list, and a failed first fetch left a false empty
    // state with no retry and no error shown).
+   // Lists must never be served from the browser cache (2026-11-22:
+   // after creating/toggling/deleting a rule the list still showed the
+   // old state until a page reload — a cached GET was served).
    let r:any=null;let d:any=null;
    for(let attempt=0;attempt<2;attempt++){
-     try{r=await fetch(url);d=await r.json();break;}
+     try{r=await fetch(url,{cache:"no-store"});d=await r.json();break;}
      catch{if(attempt===0){await new Promise(res=>setTimeout(res,1000));continue;}}
    }
    setListLoading(false);
