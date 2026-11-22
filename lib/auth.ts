@@ -109,6 +109,15 @@ export async function ensureUserWorkspace(userId: string, email: string, display
     'owner',
     now,
   ]);
+  // Self-heal (2026-11-22): the workspace's recorded owner must hold
+  // the owner role. A team-role change once demoted the owner to
+  // 'member' (the /api/team upsert overwrote the role), which silently
+  // revoked the owner's filters/labels/contacts admin rights and broke
+  // mailbox access for the All view. Runs on every login.
+  await dbRun(
+    `UPDATE memberships SET role = 'owner' WHERE workspace_id = ? AND user_id = (SELECT owner_user_id FROM workspaces WHERE id = ?) AND role != 'owner'`,
+    [workspaceId, workspaceId],
+  );
   await dbRun(
     'INSERT OR IGNORE INTO workspace_settings (workspace_id, plan, monthly_send_limit, retention_days, created_at) VALUES (?, ?, 300, 90, ?)',
     [workspaceId, 'free', now],
