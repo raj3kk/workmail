@@ -1,7 +1,7 @@
 import {NextResponse} from 'next/server';
 import {dbOne, dbRun, newId, nowIso} from '@/lib/db';
-import {requireUser} from '@/lib/guards';
-import {generateTotpSecret, totpAuthUrl, generateRecoveryCodes, hashRecoveryCode, RECOVERY_CODE_COUNT} from '@/lib/mfa';
+import {requireUser, isValidOrigin} from '@/lib/guards';
+import {generateTotpSecret, totpAuthUrl, generateRecoveryCodes, hashRecoveryCode, encryptMfaSecret, RECOVERY_CODE_COUNT} from '@/lib/mfa';
 
 export const runtime = 'nodejs';
 
@@ -32,6 +32,8 @@ async function ensureRecoveryCodesTable(): Promise<void> {
 //      codes are returned ONCE in this response — they are stored only as
 //      SHA-256 hashes and can never be retrieved again. Never logged.
 export async function POST(req: Request) {
+  if (!isValidOrigin(req))
+    return NextResponse.json({error: 'Invalid origin'}, {status: 403});
   const {user, response} = await requireUser(req);
   if (response) return response;
   if (!user) return NextResponse.json({error: 'Unauthorized'}, {status: 401});
@@ -68,6 +70,16 @@ export async function POST(req: Request) {
   } catch {
     // Column already exists.
   }
-  await dbRun('UPDATE users SET pending_mfa_secret = ? WHERE id = ?', [secret, user.id]);
+  // G-09: the staged secret is AES-256-GCM encrypted at rest
+  // (lib/crypto.ts), never plaintext. If the host encryption key is
+  // not configured, setup fails cleanly here instead of storing a
+  // plaintext secret.
+  let encrypted: string;
+  try {
+    encrypted = encryptMfaSecret(secret);
+  } catch {
+    return NextResponse.json({error: 'MFA setup is not available right now'}, {status: 503});
+  }
+  await dbRun('UPDATE users SET pending_mfa_secret = ? WHERE id = ?', [encrypted, user.id]);
   return NextResponse.json({otpauth_url: totpAuthUrl(secret, user.email), secret});
 }
