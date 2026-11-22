@@ -121,11 +121,10 @@ export default function Home(){
    let draftToDelete:string|null=draftId;
    try{const savedId=await flushDraftSave();if(savedId)draftToDelete=savedId;}catch{}
    const toAddr=to,subj=subject;
-   // E5-10: plain-text signature of the sending mailbox, appended at
-   // send time only (never stored in the draft). Template sends do not
-   // carry the signature; HTML signatures are not supported.
-   const sig=((mailboxes.find(b=>b.id===fromBoxId)?.signature)||"").trim();
-   const bodyText=(!composeTemplateId&&sig)?body+"\n\n-- \n"+sig:body;
+   // E5-10: the mailbox signature is appended server-side in
+   // lib/service-send.ts (every send path) — never here, or it doubles.
+   // Text-only signature; HTML signatures are not supported.
+   const bodyText=body;
    const ctrl=new AbortController();
    const timer=setTimeout(()=>ctrl.abort(),25000);
    let out:any=null;let resOk=false;
