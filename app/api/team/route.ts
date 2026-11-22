@@ -2,6 +2,7 @@ import {NextResponse} from 'next/server';
 import {z} from 'zod';
 import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
 import {requireUser, workspaceRole} from '@/lib/guards';
+import {isDisposableEmail} from '@/lib/email-validation';
 
 export async function GET(req: Request) {
   const {user, response} = await requireUser(req);
@@ -39,6 +40,14 @@ export async function POST(req: Request) {
     })
     .safeParse(await req.json().catch(() => null));
   if (!p.success) return NextResponse.json({error: 'Invalid invitation'}, {status: 400});
+  // G-12: disposable / temporary-mail addresses cannot be invited (the
+  // user must sign in with Google once, and temp-mail accounts are not
+  // allowed). Rejected with a clear message, never silently dropped.
+  if (isDisposableEmail(p.data.email))
+    return NextResponse.json(
+      {error: 'Disposable or temporary email addresses cannot be invited. Ask the person to use their real email address.'},
+      {status: 400},
+    );
   const role = await workspaceRole(user.id, p.data.workspace_id);
   if (!role || !['owner', 'admin'].includes(role))
     return NextResponse.json({error: 'Admin permission required'}, {status: 403});
