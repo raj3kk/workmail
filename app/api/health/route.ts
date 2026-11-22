@@ -7,8 +7,10 @@ export async function GET() {
     await dbQuery('SELECT 1 AS ok');
     return NextResponse.json({app: 'ok', d1: 'ok', latency_ms: Date.now() - t});
   } catch (e) {
+    // G-08: generic 'down' only — the D1 error text never leaves the
+    // server (it can name the database, the account, or internals).
     return NextResponse.json(
-      {app: 'ok', d1: 'down', latency_ms: Date.now() - t, error: e instanceof Error ? e.message : 'D1 unreachable'},
+      {app: 'ok', d1: 'down', latency_ms: Date.now() - t},
       {status: 503},
     );
   }
