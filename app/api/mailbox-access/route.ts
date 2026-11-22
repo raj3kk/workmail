@@ -36,7 +36,7 @@ export async function POST(req: Request) {
       [p.data.mailbox_id, p.data.user_id, p.data.permission, nowIso()],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not grant mailbox access'}, {status: 400});
+    return NextResponse.json({error: 'Could not grant mailbox access'}, {status: 400});
   }
   await dbRun(
     'INSERT INTO audit_events (id, workspace_id, actor_user_id, action, target_type, target_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
