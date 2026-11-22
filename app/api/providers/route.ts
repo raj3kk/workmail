@@ -5,6 +5,8 @@ import {requireUser, workspaceRole, listWorkspaceIds} from '@/lib/guards';
 import {encryptSecret, decryptSecret} from '@/lib/crypto';
 import {
   PROVIDER_CHAIN,
+  ALL_PROVIDERS,
+  MANUAL_ONLY_PROVIDERS,
   PROVIDER_CAPS,
   PROVIDER_DEFAULT_PRIORITY,
   getCapState,
@@ -25,7 +27,7 @@ export async function GET(req: Request) {
       chain: PROVIDER_CHAIN.map((p) => ({provider: p, caps: PROVIDER_CAPS[p], env_configured: hasEnvCredentials(p)})),
     });
   const rows = await dbQuery(
-    `SELECT id, workspace_id, provider, enabled, priority, sender_verified, sender_attested, sender_verified_via, last_test_at, created_at FROM provider_secrets
+    `SELECT id, workspace_id, provider, enabled, priority, sender_verified, sender_attested, sender_verified_via, verified_senders, last_test_at, created_at FROM provider_secrets
      WHERE workspace_id IN (${ids.map(() => '?').join(',')}) ORDER BY priority ASC`,
     ids,
   );
@@ -36,7 +38,9 @@ export async function GET(req: Request) {
   // snapshot (per-workspace detail is available via the send path logs).
   const workspaceId = String(ids[0]);
   const providers = [];
-  for (const provider of PROVIDER_CHAIN) {
+  // All providers are listed (including manual-only SendPulse); only
+  // PROVIDER_CHAIN members have an Auto chain position.
+  for (const provider of ALL_PROVIDERS) {
     const row = (rows || []).find((r: any) => r.provider === provider);
     let cap = null;
     try {
@@ -44,8 +48,17 @@ export async function GET(req: Request) {
     } catch {
       cap = null;
     }
+    let verifiedSenders: string[] = [];
+    try {
+      const parsed = JSON.parse(String(row?.verified_senders || '[]'));
+      if (Array.isArray(parsed)) verifiedSenders = parsed.map((s) => String(s).toLowerCase());
+    } catch {
+      verifiedSenders = [];
+    }
     providers.push({
       provider,
+      manual_only: MANUAL_ONLY_PROVIDERS.includes(provider),
+      verified_senders: verifiedSenders,
       configured: !!row,
       enabled: row ? row.enabled === 1 : false,
       priority: row ? row.priority : PROVIDER_DEFAULT_PRIORITY[provider],
@@ -71,10 +84,11 @@ export async function GET(req: Request) {
       caps: PROVIDER_CAPS[provider],
       cap_state: cap,
       env_configured: hasEnvCredentials(provider),
-      chain_position: PROVIDER_CHAIN.indexOf(provider) + 1,
+      // Manual-only providers have no Auto chain position (null).
+      chain_position: PROVIDER_CHAIN.includes(provider) ? PROVIDER_CHAIN.indexOf(provider) + 1 : null,
     });
   }
-  return NextResponse.json({providers, chain: PROVIDER_CHAIN});
+  return NextResponse.json({providers, chain: PROVIDER_CHAIN, manual_only: MANUAL_ONLY_PROVIDERS});
 }
 
 export async function POST(req: Request) {
@@ -135,7 +149,7 @@ async function providerVerifyCheck(
   provider: ProviderName,
   secret: {api_key: string; api_secret?: string},
   workspaceId: string,
-): Promise<{verified: boolean; checked: boolean; reason: string}> {
+): Promise<{verified: boolean; checked: boolean; reason: string; verifiedSenders?: string[]}> {
   const domains = await dbQuery(
     "SELECT domain FROM domains WHERE workspace_id = ? AND ownership_status = 'verified' AND dns_status = 'verified'",
     [workspaceId],
@@ -193,12 +207,18 @@ async function providerVerifyCheck(
     });
     if (!r.ok) return {verified: false, checked: false, reason: `SendPulse sender check failed (HTTP ${r.status}) — sender not confirmed.`};
     const list = Array.isArray(r.body) ? (r.body as Array<Record<string, unknown>>) : [];
-    const hit = list.find((s) => {
-      const email = typeof s.email === 'string' ? s.email.toLowerCase() : '';
-      const status = s.status;
-      return email && mailboxAddresses.has(email) && (status === 'active' || status === 'Active' || status === true);
-    });
-    if (hit) return {verified: true, checked: true, reason: `SendPulse confirms sender ${String(hit.email)} is active.`};
+    // Collect EVERY active sender matching a workspace mailbox, not
+    // just the first — this is the verified-senders list SendPulse
+    // actually accepts mail from (free plan: 3 slots).
+    const verifiedSenders = list
+      .filter((s) => {
+        const email = typeof s.email === 'string' ? s.email.toLowerCase() : '';
+        const status = s.status;
+        return email && mailboxAddresses.has(email) && (status === 'active' || status === 'Active' || status === true);
+      })
+      .map((s) => String(s.email).toLowerCase());
+    if (verifiedSenders.length > 0)
+      return {verified: true, checked: true, reason: `SendPulse confirms sender(s) ${verifiedSenders.join(', ')} active.`, verifiedSenders};
     return {verified: false, checked: false, reason: 'SendPulse did not return a sender list this check understands — sender not confirmed; attestation only.'};
   } catch (e) {
     return {verified: false, checked: false, reason: 'Provider check could not be reached (network error) — sender not confirmed.'};
@@ -217,13 +237,17 @@ export async function PATCH(req: Request) {
       sender_attested: z.boolean().optional(),
       verify_now: z.boolean().optional(),
       enabled: z.boolean().optional(),
+      // Owner/admin edit of the verified-sender list (SendPulse
+      // manual-only rule reads this list). Email-shaped, max 100.
+      verified_senders: z.array(z.string().email()).max(100).optional(),
     })
     .refine(
       (x) =>
         x.sender_verified !== undefined ||
         x.sender_attested !== undefined ||
         x.verify_now !== undefined ||
-        x.enabled !== undefined,
+        x.enabled !== undefined ||
+        x.verified_senders !== undefined,
     )
     .safeParse(await req.json().catch(() => null));
   if (!p.success) return NextResponse.json({error: 'Invalid verification update'}, {status: 400});
@@ -262,8 +286,10 @@ export async function PATCH(req: Request) {
         {status: check.checked ? 409 : 502},
       );
     await dbRun(
-      `UPDATE provider_secrets SET sender_verified = 1, sender_attested = 1, sender_verified_via = 'provider', last_test_at = ? WHERE workspace_id = ? AND provider = ?`,
-      [now, p.data.workspace_id, p.data.provider],
+      `UPDATE provider_secrets SET sender_verified = 1, sender_attested = 1, sender_verified_via = 'provider', last_test_at = ?${check.verifiedSenders?.length ? ', verified_senders = ?' : ''} WHERE workspace_id = ? AND provider = ?`,
+      check.verifiedSenders?.length
+        ? [now, JSON.stringify(check.verifiedSenders), p.data.workspace_id, p.data.provider]
+        : [now, p.data.workspace_id, p.data.provider],
     );
     await dbRun(
       'INSERT INTO audit_events (id, workspace_id, actor_user_id, action, target_type, target_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -301,6 +327,13 @@ export async function PATCH(req: Request) {
   if (p.data.enabled !== undefined) {
     sets.push('enabled = ?');
     values.push(p.data.enabled ? 1 : 0);
+  }
+  // Verified-sender list edit (owner/admin). Lowercased + deduped;
+  // stored as JSON. Only SendPulse enforces it today.
+  if (p.data.verified_senders !== undefined) {
+    const clean = [...new Set(p.data.verified_senders.map((s) => s.toLowerCase()))];
+    sets.push('verified_senders = ?');
+    values.push(JSON.stringify(clean));
   }
   const r = await dbRun(
     `UPDATE provider_secrets SET ${sets.join(', ')} WHERE workspace_id = ? AND provider = ?`,
