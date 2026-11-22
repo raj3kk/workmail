@@ -33,8 +33,10 @@ export async function POST(req: Request) {
     [p.data.message_id],
   );
   if (!msg) return NextResponse.json({error: 'Message not found'}, {status: 404});
+  // P-02: 404 (not 403) on denial, so a cross-tenant message-id probe
+  // cannot confirm another tenant's message exists by the status code.
   if (!(await canAccessMailbox(user.id, String(msg.mailbox_id), true)))
-    return NextResponse.json({error: 'Mailbox write access denied'}, {status: 403});
+    return NextResponse.json({error: 'Message not found'}, {status: 404});
   const box = await dbOne('SELECT address FROM mailboxes WHERE id = ?', [msg.mailbox_id]);
   if (!box) return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
   let text: string;
