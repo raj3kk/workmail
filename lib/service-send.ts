@@ -551,10 +551,18 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
   const pickedProvider =
     input.provider && input.provider !== 'auto' ? (input.provider as ProviderName) : null;
   if (pickedProvider) {
-    const verifiedRow = await dbOne(
-      'SELECT provider FROM provider_secrets WHERE workspace_id = ? AND provider = ? AND enabled = 1 AND (sender_verified = 1 OR sender_attested = 1)',
-      [input.workspaceId, pickedProvider],
-    );
+    // verified_senders comes from migration 0010; if the column is
+    // ever missing (stale DB), the pick is rejected with 409 rather
+    // than crashing the send with a 500.
+    let verifiedRow: {provider?: unknown; verified_senders?: unknown} | null = null;
+    try {
+      verifiedRow = await dbOne(
+        'SELECT provider, verified_senders FROM provider_secrets WHERE workspace_id = ? AND provider = ? AND enabled = 1 AND (sender_verified = 1 OR sender_attested = 1)',
+        [input.workspaceId, pickedProvider],
+      );
+    } catch {
+      verifiedRow = null;
+    }
     if (!verifiedRow)
       return finish({
         status: 409,
@@ -566,6 +574,34 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
         providerMessageId: null,
         messageId: null,
       });
+    // SendPulse is manual-only (owner order 2026-11-22): it accepts
+    // mail ONLY from its verified sender addresses (free plan: 3).
+    // A manual SendPulse pick from any other mailbox is rejected here
+    // with 409 — before any provider call — so the UI must only offer
+    // verified senders when SendPulse is picked, and the API enforces
+    // the same rule. The list lives on the provider_secrets row
+    // (verified_senders JSON array), set by "Verify now" (which reads
+    // the provider's own sender list) or by an owner/admin edit.
+    if (pickedProvider === 'sendpulse') {
+      let verifiedSenders: string[] = [];
+      try {
+        const parsed = JSON.parse(String((verifiedRow as {verified_senders?: unknown}).verified_senders || '[]'));
+        if (Array.isArray(parsed)) verifiedSenders = parsed.map((s) => String(s).toLowerCase());
+      } catch {
+        verifiedSenders = [];
+      }
+      if (!verifiedSenders.includes(sender.address.toLowerCase()))
+        return finish({
+          status: 409,
+          body: {
+            error: `${sender.address} is not a verified SendPulse sender — SendPulse accepts mail only from its verified sender addresses. Pick Auto or a verified mailbox.`,
+          },
+          outcome: 'rejected',
+          provider: null,
+          providerMessageId: null,
+          messageId: null,
+        });
+    }
   }
 
   // Attachments resolve BEFORE the idempotency key is reserved: a
