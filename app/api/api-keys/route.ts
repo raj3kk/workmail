@@ -104,8 +104,10 @@ async function revokeKey(userId: string, id: string) {
   const row = rows[0];
   if (!row) return NextResponse.json({error: 'API key not found.'}, {status: 404});
   const role = await workspaceRole(userId, String(row.workspace_id));
+  // P-02: 404 (not 403) on denial, so a cross-tenant key-id probe
+  // cannot confirm another tenant's API key exists by the status code.
   if (role !== 'owner' && role !== 'admin')
-    return NextResponse.json({error: 'Only workspace owners and admins can revoke API keys.'}, {status: 403});
+    return NextResponse.json({error: 'API key not found.'}, {status: 404});
   if (row.revoked_at) return NextResponse.json({revoked: true, already_revoked: true});
   await dbRun('UPDATE api_keys SET revoked_at = ? WHERE id = ?', [nowIso(), id]);
   return NextResponse.json({revoked: true});
