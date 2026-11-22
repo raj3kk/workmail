@@ -108,6 +108,11 @@ export default function Home(){
  // 07:12:58.506Z, draft never deleted). Refs update in the same tick,
  // so send() reads this ref, never the possibly-stale state.
  const draftIdRef=useRef<string|null>(null);
+ // activeIdRef: the active message id, kept fresh by an effect on
+ // [active] so refresh() can decide the auto-select + loadDetail from
+ // one source (see refresh() — the stale-closure bug, Batch 7b).
+ const activeIdRef=useRef<string|null>(null);
+ useEffect(()=>{activeIdRef.current=active?active.id:null;},[active]);
  // A fresh compose session starts unsent.
  useEffect(()=>{if(compose)sentRef.current=false;},[compose]);
  useEffect(()=>{const q=window.matchMedia("(max-width: 850px)");const f=()=>setIsNarrow(q.matches);f();q.addEventListener("change",f);return ()=>q.removeEventListener("change",f);},[]);
@@ -150,12 +155,22 @@ export default function Home(){
    setListLoading(false);
    if(!r||!d){setNotice("Could not load messages — tap Refresh to retry");return;}
    if(!r.ok){setNotice(d.error||"Could not load messages");return;}
-   const list=d.messages||[];setMessages(append?[...messages,...list]:list);setTotal(d.total||0);setHasMore(!!d.has_more);setActive(cur=>{const l=append?[...messages,...list]:list;return cur&&l.some((x:any)=>x.id===cur.id)?cur:l[0]||null;});loadCounts();
-   // Auto-selected first message needs its detail too (2026-11-22: the
-   // reader showed the top message without attachments/HTML until it was
-   // clicked, because loadDetail only ran on click). loadDetail's guard
-   // drops the update if another message became active meanwhile.
-   if(!append&&list.length>0){const willAuto=!active||!list.some((x:any)=>x.id===active.id);if(willAuto)loadDetail(list[0]);}
+   const list=d.messages||[];
+   const newList=append?[...messages,...list]:list;
+   setMessages(newList);setTotal(d.total||0);setHasMore(!!d.has_more);
+   // Auto-select + detail, decided from ONE source (activeIdRef): the
+   // kept message is the previously-active one when it is still in the
+   // list, else the first row. The old code picked the message from the
+   // LIVE state in the setActive updater but decided loadDetail from
+   // the STALE closure `active` — the two disagreed after a view
+   // change (the effect had just setActive(null)), so the auto-selected
+   // message was shown without its detail (no attachments, no HTML)
+   // until clicked (Batch 7b, 2026-11-22). loadDetail's guard drops
+   // the update if another message became active meanwhile.
+   const keptId=activeIdRef.current;
+   const kept=keptId&&newList.some((x:any)=>x.id===keptId)?newList.find((x:any)=>x.id===keptId):newList[0]||null;
+   setActive(kept);loadCounts();
+   if(!append&&kept)loadDetail(kept);
  }
  async function loadMore(){if(loadingMore||!hasMore)return;setLoadingMore(true);await refresh(messages.length,true);setLoadingMore(false);}
  // The old effect cleared the list BEFORE the fetch, so a failed first
