@@ -10,7 +10,11 @@ export const runtime = 'nodejs';
 // `messages:read` — the same read scope as GET /api/v1/messages, so
 // no new scope is invented. Returns ONLY the key's own workspace
 // mailboxes, so an integrator can discover mailbox IDs without
-// reading D1 or the UI: [{id, address, display_name}].
+// reading D1 or the UI: [{id, address, display_name, signature}].
+// `signature` (S3) is included so an integrator can see what text the
+// server appends to sends from that mailbox (E5-10: the signature is
+// appended server-side in lib/service-send.ts on every send path) —
+// it is the mailbox's own data, same workspace, no new exposure.
 // Only active mailboxes are listed, oldest first (the first one is
 // the workspace default — the mailbox POST /api/v1/send uses when
 // mailbox_id is omitted). No pagination: a workspace has a handful
@@ -31,7 +35,7 @@ export async function GET(req: Request) {
   if (!rl.allowed) return rateLimitResponse(rl);
 
   const rows = await dbQuery(
-    'SELECT id, address, display_name FROM mailboxes WHERE workspace_id = ? AND is_active = 1 ORDER BY created_at ASC',
+    'SELECT id, address, display_name, signature FROM mailboxes WHERE workspace_id = ? AND is_active = 1 ORDER BY created_at ASC',
     [key.workspaceId],
   );
   return NextResponse.json({
@@ -39,6 +43,7 @@ export async function GET(req: Request) {
       id: String(r.id),
       address: String(r.address),
       display_name: String(r.display_name || ''),
+      signature: String(r.signature || ''),
     })),
   });
 }
