@@ -345,7 +345,13 @@ function wrapTemplate(opts: {
   ctaUrl?: string;
   ctaLabel?: string;
 }): string {
-  const logo = `${appBaseUrl()}/email-logo.png`;
+  // Gmail caches images by URL: the old logo was served from this exact
+  // URL, so Gmail's image proxy keeps showing it even though the file
+  // is the new logo. The ?v=2 query busts that cache (2026-11-22: the
+  // 20:25 template mail showed the OLD blue "99" although the live file
+  // is the new glossy logo). Seeded defaults' stored html is updated
+  // in D1 to match; brandTemplateHtml's guard still matches.
+  const logo = `${appBaseUrl()}/email-logo.png?v=2`;
   const cta = opts.ctaUrl
     ? `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0 8px 0;"><tr><td align="center" bgcolor="#2e4a9e" style="border-radius:8px;border:1px solid #22367a;"><a href="${opts.ctaUrl}" style="display:inline-block;padding:13px 28px;font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:bold;color:#ffffff;text-decoration:none;">${opts.ctaLabel || 'Continue'}</a></td></tr></table>`
     : '';
@@ -379,7 +385,8 @@ function wrapTemplate(opts: {
  */
 export function brandTemplateHtml(html: string, senderName: string): string {
   if (!html || html.includes('email-logo.png')) return html;
-  const logo = `${appBaseUrl()}/email-logo.png`;
+  // ?v=2 — same Gmail image-cache bust as wrapTemplate (2026-11-22).
+  const logo = `${appBaseUrl()}/email-logo.png?v=2`;
   const name = senderName
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
