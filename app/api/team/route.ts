@@ -52,23 +52,33 @@ export async function POST(req: Request) {
   if (!role || !['owner', 'admin'].includes(role))
     return NextResponse.json({error: 'Admin permission required'}, {status: 403});
   const target = await dbOne('SELECT id, email FROM users WHERE email = ?', [p.data.email.toLowerCase()]);
-  if (!target)
-    return NextResponse.json(
-      {error: 'User must sign in with Google once before they can be added. Share the workspace invite instructions.'},
-      {status: 404},
-    );
-  try {
+  if (target) {
+    try {
+      await dbRun(
+        `INSERT INTO memberships (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(workspace_id, user_id) DO UPDATE SET role = excluded.role`,
+        [p.data.workspace_id, target.id, p.data.role, nowIso()],
+      );
+    } catch {
+      // P-01: never return the database error text — D1/Cloudflare
+      // messages can name tables and constraints (internal detail).
+      return NextResponse.json({error: 'Could not add member'}, {status: 400});
+    }
     await dbRun(
-      `INSERT INTO memberships (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)
-       ON CONFLICT(workspace_id, user_id) DO UPDATE SET role = excluded.role`,
-      [p.data.workspace_id, target.id, p.data.role, nowIso()],
+      'INSERT INTO audit_events (id, workspace_id, actor_user_id, action, target_type, target_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [newId(), p.data.workspace_id, user.id, 'member.role_changed', 'membership', target.id, nowIso()],
     );
-  } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not add member'}, {status: 400});
   }
-  await dbRun(
-    'INSERT INTO audit_events (id, workspace_id, actor_user_id, action, target_type, target_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [newId(), p.data.workspace_id, user.id, 'member.role_changed', 'membership', target.id, nowIso()],
-  );
-  return NextResponse.json({success: true});
+  // P-01 (privacy): the response is IDENTICAL whether or not the
+  // invited email has a WorkMail account. A 404 for "no such user"
+  // would let any workspace admin enumerate WorkMail accounts by
+  // email (confirm/deny). The person is added only when they exist;
+  // the team list (their own workspace) shows who actually joined.
+  // The UI must show this message, not claim "Team role updated."
+  // when nobody was added — see the coordinator note in the S2 report.
+  return NextResponse.json({
+    success: true,
+    message:
+      'If the person has a WorkMail account, they have been added to the workspace. Ask them to sign in with Google first if they are not listed yet.',
+  });
 }
