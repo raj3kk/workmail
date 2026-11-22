@@ -52,7 +52,7 @@ export async function POST(req: Request) {
       [id, b.workspace_id, b.mailbox_id || null, b.name.trim().slice(0, 120), jstr(b.conditions), jstr(b.actions), user.id, nowIso()],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not create rule'}, {status: 400});
+    return NextResponse.json({error: 'Could not create rule'}, {status: 400});
   }
   const rule = await dbOne('SELECT * FROM mail_rules WHERE id = ?', [id]);
   return NextResponse.json({rule});
@@ -67,8 +67,10 @@ export async function PATCH(req: Request) {
   const rule = await dbOne('SELECT workspace_id FROM mail_rules WHERE id = ?', [b.id]);
   if (!rule) return NextResponse.json({error: 'Rule not found'}, {status: 404});
   const role = await workspaceRole(user.id, String(rule.workspace_id));
+  // P-02: 404 (not 403) on denial, so a cross-tenant rule-id probe
+  // cannot confirm another tenant's mail rule exists by the status code.
   if (!role || !['owner', 'admin'].includes(role))
-    return NextResponse.json({error: 'Workspace admin required'}, {status: 403});
+    return NextResponse.json({error: 'Rule not found'}, {status: 404});
   const sets: string[] = [];
   const values: unknown[] = [];
   if (typeof b.name === 'string' && b.name.trim()) {
@@ -110,8 +112,9 @@ export async function DELETE(req: Request) {
   const rule = await dbOne('SELECT workspace_id FROM mail_rules WHERE id = ?', [b.id]);
   if (!rule) return NextResponse.json({error: 'Rule not found'}, {status: 404});
   const role = await workspaceRole(user.id, String(rule.workspace_id));
+  // P-02: 404 (not 403) on denial — see PATCH above.
   if (!role || !['owner', 'admin'].includes(role))
-    return NextResponse.json({error: 'Workspace admin required'}, {status: 403});
+    return NextResponse.json({error: 'Rule not found'}, {status: 404});
   await dbRun('DELETE FROM mail_rules WHERE id = ?', [b.id]);
   return NextResponse.json({success: true});
 }
