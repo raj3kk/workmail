@@ -123,7 +123,7 @@ export default function BulkPage() {
   // Emails the user unchecked in the pasted list (excluded from the campaign).
   const [excluded, setExcluded] = useState<string[]>([]);
   const [subject, setSubject] = useState("Hello {{name}}");
-  const [text, setText] = useState("Hi {{name}},\n\nThis is a message from WorkMail.");
+  const [text, setText] = useState("Hi {{name}},\n\n[Type your message here]");
   const [html, setHtml] = useState("");
   const [templates, setTemplates] = useState<any[]>([]);
   const [templateId, setTemplateId] = useState("");
