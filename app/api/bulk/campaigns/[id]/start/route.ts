@@ -24,7 +24,8 @@ export async function POST(req: Request, {params}: {params: {id: string}}) {
   const campaign = await dbOne('SELECT * FROM bulk_campaigns WHERE id = ?', [params.id]);
   if (!campaign) return NextResponse.json({error: 'Campaign not found.'}, {status: 404});
   const role = await workspaceRole(user.id, String(campaign.workspace_id));
-  if (!role) return NextResponse.json({error: 'Workspace access denied'}, {status: 403});
+  // P-02: 404 (not 403) on denial — see GET /api/bulk/campaigns/[id].
+  if (!role) return NextResponse.json({error: 'Campaign not found.'}, {status: 404});
   if (!(await canAccessMailbox(user.id, String(campaign.mailbox_id), true)))
     return NextResponse.json({error: 'No send permission on this mailbox.'}, {status: 403});
   if (!['draft', 'paused_caps'].includes(String(campaign.status)))
@@ -71,8 +72,12 @@ export async function POST(req: Request, {params}: {params: {id: string}}) {
     // (never a guessed state). Non-2xx when the tick processed nothing;
     // 200 when some recipients were decided before the failure, so the
     // UI keeps the confirmed progress and polls on.
-    const message = err instanceof Error ? err.message : String(err);
-    console.error('[bulk start tick]', params.id, message);
+    // P-04: the raw tick error can carry D1/Cloudflare internals —
+    // it stays in the server log and the client gets only the
+    // controlled message (see GET /api/bulk/campaigns/[id]).
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const message = rawMessage === 'Campaign not found.' ? rawMessage : 'Campaign tick failed. Check the server logs and retry.';
+    console.error('[bulk start tick]', params.id, rawMessage);
     const summary = await getBulkCampaignSummary(params.id);
     const decided = (s: {sent: number; failed: number; skipped: number; unknown: number} | null) =>
       s ? s.sent + s.failed + s.skipped + s.unknown : 0;
