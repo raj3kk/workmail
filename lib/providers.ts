@@ -1,7 +1,14 @@
 // WorkMail outbound provider fallback engine.
 //
-// Chain order (fixed — do not reorder without a coordinator decision):
-//   SendPulse -> Brevo -> Mailjet -> Resend
+// Auto chain (owner order 2026-11-22 — SendPulse removed from Auto, see
+// below): Brevo -> Mailjet -> Resend. SendPulse is MANUAL-ONLY: it is
+// never tried by Auto, only when the user explicitly picks it, and only
+// from a mailbox in that provider's verified_senders list (the
+// SendPulse free plan allows 3 sender addresses, all used, and its
+// sends 422 any other From). A manual SendPulse pick from an
+// unverified mailbox is rejected with 409 before any provider call
+// (lib/service-send.ts). Do not re-add SendPulse to the Auto chain
+// without the owner's explicit word.
 //
 // Rules enforced here (see docs/FREE-PROVIDER-QUOTAS.md for the numbers):
 //   1. Per-provider hourly/daily/monthly caps, counted from D1
@@ -42,7 +49,20 @@ import {dbOne, dbRun, jstr, newId, nowIso} from '@/lib/db';
 
 export type ProviderName = 'sendpulse' | 'brevo' | 'mailjet' | 'resend';
 
-export const PROVIDER_CHAIN: ProviderName[] = ['sendpulse', 'brevo', 'mailjet', 'resend'];
+/** Every provider WorkMail knows, including manual-only ones. */
+export const ALL_PROVIDERS: ProviderName[] = ['sendpulse', 'brevo', 'mailjet', 'resend'];
+
+/**
+ * Providers that are NEVER tried by Auto — explicit manual pick only.
+ * SendPulse was removed from the Auto chain by owner order 2026-11-22:
+ * its free plan allows 3 sender addresses (all used) and it 422s any
+ * other From, so Auto kept burning an attempt on every send from an
+ * unverified mailbox before falling through.
+ */
+export const MANUAL_ONLY_PROVIDERS: ProviderName[] = ['sendpulse'];
+
+/** Auto fallback chain order. SendPulse is NOT in it (manual-only). */
+export const PROVIDER_CHAIN: ProviderName[] = ['brevo', 'mailjet', 'resend'];
 
 /**
  * True only for the four exact provider strings. Route/service agents
