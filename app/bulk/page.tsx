@@ -20,7 +20,7 @@ type Preview = {
 };
 type Campaign = {
   id: string; workspace_id: string; mailbox_id: string; name: string; subject: string;
-  status: string; total_recipients: number; sent: number; failed: number; skipped: number;
+  status: string; provider?: string; total_recipients: number; sent: number; failed: number; skipped: number;
   unknown: number; pending: number; pause_reason: string | null; started_at: string | null;
   finished_at: string | null; created_at: string;
 };
@@ -48,11 +48,16 @@ export default function BulkPage() {
   const [text, setText] = useState("Hi {{name}},\n\nThis is a message from {{company}}.");
   const [html, setHtml] = useState("");
   const [campaignName, setCampaignName] = useState("");
+  const [provider, setProvider] = useState("auto");
   const [campaign, setCampaign] = useState<Campaign | null>(null);
   const [recipients, setRecipients] = useState<RecipientRow[]>([]);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  // True while the last poll/start could not confirm the campaign state.
+  // Counts on screen stay the last confirmed server summary — nothing is
+  // ever advanced optimistically while this is set.
+  const [statusUnknown, setStatusUnknown] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -78,10 +83,28 @@ export default function BulkPage() {
   }
   useEffect(() => { loadCampaigns(); }, [workspaceId]);
 
+  // Status poll: the ONLY source of progress counts is the server
+  // summary (d.campaign). On any poll failure the last confirmed
+  // campaign/recipients stay on screen untouched and the UI says the
+  // status is unknown — progress is never guessed or advanced locally.
   async function pollStatus(id: string) {
-    const r = await fetch(`/api/bulk/campaigns/${id}?limit=50`);
-    const d = await r.json();
-    if (!r.ok) { setNotice(d.error || "Could not load campaign status"); return; }
+    let r: Response;
+    let d: any;
+    try {
+      r = await fetch(`/api/bulk/campaigns/${id}?limit=50`);
+      d = await r.json();
+    } catch {
+      setStatusUnknown(true);
+      setNotice("Campaign status unknown — refreshing, not assuming progress. Counts below are the last confirmed server values.");
+      return;
+    }
+    if (!r.ok) {
+      setStatusUnknown(true);
+      setNotice(`Campaign status unknown — refreshing, not assuming progress. ${d.error || "Could not load campaign status"}`);
+      return;
+    }
+    setStatusUnknown(false);
+    if (d.tick_error) setNotice(`Last tick reported an error (counts below are still the confirmed server values): ${d.tick_error}`);
     setCampaign(d.campaign);
     setRecipients(d.recipients || []);
     if (d.campaign.status !== "sending") {
@@ -114,25 +137,55 @@ export default function BulkPage() {
     if (!preview || !mailboxId) { setNotice("Upload and preview a file, then pick a sending mailbox."); return; }
     if (!subject.trim() || (!text.trim() && !html.trim())) { setNotice("Write a subject and a message body first."); return; }
     setBusy(true);
-    const r = await fetch("/api/bulk/campaigns", {method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({workspace_id: workspaceId, mailbox_id: mailboxId, name: campaignName, subject, text, html, recipients: preview.recipients})});
-    const d = await r.json();
-    setBusy(false);
-    if (!r.ok) { setNotice(d.error || "Could not create the campaign"); return; }
-    setCampaign(d.campaign);
-    setNotice(d.monthly_warning || `Campaign created with ${d.campaign.total_recipients} recipients. Review it, then press Start.`);
-    loadCampaigns();
+    try {
+      const r = await fetch("/api/bulk/campaigns", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({workspace_id: workspaceId, mailbox_id: mailboxId, name: campaignName, subject, text, html, provider, recipients: preview.recipients})});
+      const d = await r.json();
+      if (!r.ok) { setNotice(d.error || "Could not create the campaign"); return; }
+      setCampaign(d.campaign);
+      setNotice(d.monthly_warning || `Campaign created with ${d.campaign.total_recipients} recipients. Review it, then press Start.`);
+      loadCampaigns();
+    } catch {
+      setNotice("Could not create the campaign (no response from the server). Nothing was created that we know of — refresh the campaign list before retrying.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function startCampaign() {
     if (!campaign) return;
     setBusy(true);
-    const r = await fetch(`/api/bulk/campaigns/${campaign.id}/start`, {method: "POST"});
-    const d = await r.json();
+    let r: Response;
+    let d: any;
+    try {
+      r = await fetch(`/api/bulk/campaigns/${campaign.id}/start`, {method: "POST"});
+      d = await r.json();
+    } catch {
+      // No reliable answer from the server: the campaign may or may not
+      // be sending. Keep the last confirmed campaign on screen and say
+      // the status is unknown — never assume the start worked.
+      setStatusUnknown(true);
+      setNotice("Campaign status unknown — refreshing, not assuming progress. The start request got no response; the campaign may or may not be sending.");
+      setBusy(false);
+      return;
+    }
     setBusy(false);
-    if (!r.ok) { setNotice(d.error || "Could not start the campaign"); return; }
+    if (!r.ok) {
+      // The server answered with a definite error (e.g. 409 already
+      // sending): that IS known state, so show it. A tick_error with a
+      // campaign body means some progress was confirmed — keep it.
+      if (d.campaign) {
+        setCampaign(d.campaign);
+        setStatusUnknown(false);
+        setNotice(d.tick_error ? `Start tick failed partway (confirmed progress kept): ${d.tick_error}` : (d.error || "Could not start the campaign"));
+      } else {
+        setNotice(d.error || "Could not start the campaign");
+      }
+      return;
+    }
+    setStatusUnknown(false);
     setCampaign(d.campaign);
-    setNotice("Campaign sending — progress updates every 2 seconds. Keep this page open.");
+    setNotice(d.tick_error ? `Campaign sending — progress updates every 2 seconds. Note: the first tick reported an error: ${d.tick_error}` : "Campaign sending — progress updates every 2 seconds. Keep this page open.");
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(() => pollStatus(campaign.id), 2000);
   }
@@ -140,14 +193,20 @@ export default function BulkPage() {
   async function stopCampaign() {
     if (!campaign) return;
     setBusy(true);
-    const r = await fetch(`/api/bulk/campaigns/${campaign.id}/stop`, {method: "POST"});
-    const d = await r.json();
-    setBusy(false);
-    if (!r.ok) { setNotice(d.error || "Could not stop the campaign"); return; }
-    setCampaign(d.campaign);
-    setNotice("Campaign stopped. Sent recipients stay sent; the rest stay pending.");
-    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-    loadCampaigns();
+    try {
+      const r = await fetch(`/api/bulk/campaigns/${campaign.id}/stop`, {method: "POST"});
+      const d = await r.json();
+      if (!r.ok) { setNotice(d.error || "Could not stop the campaign"); return; }
+      setCampaign(d.campaign);
+      setNotice("Campaign stopped. Sent recipients stay sent; the rest stay pending.");
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      loadCampaigns();
+    } catch {
+      setStatusUnknown(true);
+      setNotice("Campaign status unknown — refreshing, not assuming progress. The stop request got no response; the campaign may or may not have stopped.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function openCampaign(c: Campaign) {
@@ -171,6 +230,7 @@ export default function BulkPage() {
       <aside className="sidebar">
         <div className="brand"><span className="logo smallLogo">W</span><span><b>WorkMail</b><small>BULK SEND</small></span></div>
         <button className="nav" onClick={() => { location.href = "/"; }}>← Back to inbox</button>
+        <button className="nav" onClick={() => { location.href = "/dashboard"; }}>▤ Dashboard</button>
         <div className="navLabel">WORKSPACE</div>
         <select value={workspaceId} onChange={(e) => setWorkspaceId(e.target.value)}>
           {workspaces.map((w: any) => <option key={w.id} value={w.id}>{w.name}</option>)}
@@ -217,6 +277,16 @@ export default function BulkPage() {
             <label>Subject<input value={subject} onChange={(e) => setSubject(e.target.value)} style={{width: "100%"}} /></label>
             <label>Text body<textarea value={text} onChange={(e) => setText(e.target.value)} rows={6} style={{width: "100%"}} /></label>
             <label>HTML body (optional)<textarea value={html} onChange={(e) => setHtml(e.target.value)} rows={4} style={{width: "100%"}} placeholder="<p>Hi {{name}}, …</p>" /></label>
+            <label>Provider
+              <select value={provider} onChange={(e) => setProvider(e.target.value)} style={{width: "100%"}}>
+                <option value="auto">Auto (fallback chain)</option>
+                <option value="sendpulse">SendPulse</option>
+                <option value="brevo">Brevo</option>
+                <option value="mailjet">Mailjet</option>
+                <option value="resend">Resend</option>
+              </select>
+            </label>
+            <small className="muted">Auto tries providers in fallback order. A manual pick sends through ONLY that provider — no silent fallback; if it rejects, the send fails honestly.</small>
             {unknownInCompose.length > 0 && <div className="warn">Unknown placeholders (no such column — they will render empty): {unknownInCompose.map((p) => `{{${p}}}`).join(", ")}</div>}
             {sample && (
               <div style={{marginTop: 8, border: "1px solid var(--hatch-widget-border, #ddd)", padding: 12, borderRadius: 8}}>
@@ -233,7 +303,9 @@ export default function BulkPage() {
           {campaign && (
             <section>
               <h2>3 · Send &amp; progress</h2>
-              <p><b>{campaign.name || campaign.subject}</b> · status: <b>{campaign.status}</b>{campaign.pause_reason ? ` — ${campaign.pause_reason}` : ""}</p>
+              {/* Counts below come ONLY from the server summary (campaign) — never computed or advanced locally. */}
+              <p><b>{campaign.name || campaign.subject}</b> · status: <b>{campaign.status}</b> · provider: <b>{!campaign.provider || campaign.provider === "auto" ? "Auto (fallback chain)" : campaign.provider}</b>{campaign.pause_reason ? ` — ${campaign.pause_reason}` : ""}</p>
+              {statusUnknown && <div className="warn" style={{marginTop: 8}}>Status unknown — refreshing, not assuming progress. Counts below are the last confirmed server values.</div>}
               <p>{done} / {campaign.total_recipients} processed · sent {campaign.sent} · failed {campaign.failed} · skipped {campaign.skipped} · unknown {campaign.unknown} · pending {campaign.pending}</p>
               <div style={{height: 10, background: "#eee", borderRadius: 5, overflow: "hidden"}}>
                 <div style={{width: `${campaign.total_recipients ? Math.round((done / campaign.total_recipients) * 100) : 0}%`, height: "100%", background: "#2563eb"}} />
