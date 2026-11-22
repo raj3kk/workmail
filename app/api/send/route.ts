@@ -2,12 +2,10 @@ import {NextResponse} from 'next/server';
 import {z} from 'zod';
 import {randomUUID} from 'node:crypto';
 import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
-import {requireUser, canAccessMailbox, workspaceRole} from '@/lib/guards';
+import {requireUser, canAccessMailbox, workspaceRole, isValidOrigin} from '@/lib/guards';
+import {withRateLimit, RATE_LIMIT_DEFAULTS} from '@/lib/rate-limit';
 import {
   executeSend,
-  executeServiceSend,
-  validateServiceToken,
-  SERVICE_CONTEXT_AI_AUTO_REPLY,
   type SendExecution,
 } from '@/lib/service-send';
 import {computeNextAttemptIso} from '@/lib/retry';
@@ -27,12 +25,8 @@ const schema = z
     // replying. Without them the send starts a new thread.
     thread_id: z.string().uuid().optional(),
     in_reply_to: z.string().max(998).optional(),
-    // Service-only fields. `service_context` must be 'ai-auto-reply' for
-    // a service-authenticated send; `idempotency_key` lets the AI
-    // auto-reply path use a deterministic key (one auto-reply per
-    // inbound message). Both are ignored on the user-session path
-    // except that the header idempotency key still takes precedence.
-    service_context: z.string().max(64).optional(),
+    // `idempotency_key` lets a caller use a deterministic key (one send
+    // per key). The Idempotency-Key header still takes precedence.
     idempotency_key: z.string().max(200).optional(),
     // Provider pick (F1/F2): 'auto' = fallback chain (default), or one
     // of the four providers for a manual single-provider send. The
@@ -217,72 +211,41 @@ async function recordOutboundJob(input: {
   }
 }
 
-// POST /api/send — two authenticated entry points, ONE send pipeline
-// (lib/service-send.ts `executeSend`, shared so the service path can
-// never bypass idempotency, suppression, caps, or the timeout=unknown
-// rule):
-//   1. User session (default): session cookie via requireUser, workspace
-//      membership + mailbox send permission, sender mailbox resolved
-//      from the user's accessible mailboxes. Unchanged behaviour.
-//   2. Service auth: `Authorization: Bearer <OPS_CRON_TOKEN>` (header
-//      ONLY — never a query string) + body `service_context:
-//      'ai-auto-reply'` + `mailbox_id`. No user session is required.
-//      A Bearer token that fails validation is 401 immediately (it does
-//      NOT fall through to the session path); a valid token with any
-//      other service_context is also 401 — the token authorises AI
-//      auto-reply sends and nothing else.
+// POST /api/send — ONE authenticated entry point, ONE send pipeline
+// (lib/service-send.ts `executeSend`, shared so no path can bypass
+// idempotency, suppression, caps, or the timeout=unknown rule):
+//   User session only: session cookie via requireUser, workspace
+//   membership + mailbox send permission, sender mailbox resolved
+//   from the user's accessible mailboxes.
+//
+// G-02 (closed): the HTTP service branch is DELETED. It accepted
+// `Authorization: Bearer <OPS_CRON_TOKEN>` and sent as any
+// workspace/mailbox — a single-token arbitrary-send hole. The grep
+// (2026-11-22) found NO live HTTP caller of it: the AI auto-reply
+// calls `executeServiceSend` in-process (lib/ai.ts, no HTTP hop),
+// the inbound worker calls only /api/inbound, no cron calls it
+// (vercel.json has no crons), and the UI sends with a session cookie.
+// Per decision D5 the branch dies rather than being kept "just in
+// case". OPS_CRON_TOKEN still authenticates the ops routes
+// (/api/ops/monitor, /api/ops/reconcile) — those are untouched.
+// NOTE: lib/service-send.ts still exports validateServiceToken /
+// executeServiceSend / SERVICE_CONTEXT_AI_AUTO_REPLY for the
+// in-process AI caller; the HTTP validation half is now dead code
+// owned by that file — Phase 3b / the coordinator may remove it.
 export async function POST(req: Request) {
+  if (!isValidOrigin(req))
+    return NextResponse.json({error: 'Invalid origin'}, {status: 403});
   const raw = await req.json().catch(() => null);
-  const authHeader = req.headers.get('authorization');
-  const isServiceCall = !!authHeader && /^Bearer\s+/i.test(authHeader);
-
-  if (isServiceCall) {
-    if (!validateServiceToken(authHeader))
-      return NextResponse.json({error: 'Unauthorized'}, {status: 401});
-    if (raw?.service_context !== SERVICE_CONTEXT_AI_AUTO_REPLY)
-      return NextResponse.json(
-        {error: 'Service token is only valid for AI auto-reply sends.'},
-        {status: 401},
-      );
-    const parsed = schema.safeParse(raw);
-    if (!parsed.success)
-      return NextResponse.json({error: 'Invalid message', details: parsed.error.flatten()}, {status: 400});
-    const d = parsed.data;
-    if (!d.mailbox_id)
-      return NextResponse.json({error: 'mailbox_id is required for service sends.'}, {status: 400});
-    const idempotencyKey = req.headers.get('idempotency-key') || d.idempotency_key || randomUUID();
-    const exec = await executeServiceSend({
-      workspaceId: d.workspace_id,
-      mailboxId: d.mailbox_id,
-      to: d.to,
-      subject: d.subject,
-      text: d.text,
-      html: d.html,
-      idempotencyKey,
-      draftId: d.draft_id,
-      attachments: d.attachments,
-      templateId: d.template_id,
-      variables: d.variables,
-    });
-    await recordOutboundJob({
-      workspaceId: d.workspace_id,
-      mailboxId: d.mailbox_id,
-      to: d.to,
-      subject: d.subject,
-      text: d.text,
-      html: d.html,
-      idempotencyKey,
-      exec,
-      threadId: d.thread_id,
-      inReplyTo: d.in_reply_to,
-      attachments: d.attachments,
-    });
-    return NextResponse.json(exec.body, {status: exec.status});
-  }
-
   const {user, response} = await requireUser(req);
   if (response) return response;
   if (!user) return NextResponse.json({error: 'Unauthorized'}, {status: 401});
+  const limited = await withRateLimit({
+    scope: 'send',
+    subject: user.id,
+    limit: RATE_LIMIT_DEFAULTS.send.limit,
+    windowSeconds: RATE_LIMIT_DEFAULTS.send.windowSeconds,
+  });
+  if (limited) return limited;
   const parsed = schema.safeParse(raw);
   if (!parsed.success)
     return NextResponse.json({error: 'Invalid message', details: parsed.error.flatten()}, {status: 400});
