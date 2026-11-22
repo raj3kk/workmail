@@ -1,0 +1,23 @@
+-- WorkMail Bulk v2 (E3 + E5-5) — ADDITIVE ONLY.
+-- Apply one statement at a time via the D1 /query endpoint (the /batch
+-- endpoint 404s on this account); see ~/workspace/workmail-audit/apply_d1.py.
+-- Do NOT edit db/schema.sql for this feature (coordinator merges at the end).
+-- Renumbered from 0005: Phase 4 took 0005_gmail_mirror.sql (coordinator
+-- notice 2026-11-22 ~08:36 IST); 0006 = ai_keys, 0007 = mailbox signatures.
+-- Tenant isolation is enforced in application code (membership checks in
+-- every /api/bulk route); D1 has no row-level security.
+--
+-- personalized: 1 = per-recipient rendering ({{name}}, {{email}}, CSV
+-- columns); 0 = SAME — one identical body for everyone (creation rejects
+-- per-recipient variables in that mode). DEFAULT 1 preserves the old
+-- behaviour: every campaign created before this column existed rendered
+-- per recipient.
+-- attachments: JSON array of SendAttachmentRef objects
+--   [{object_key, file_name, content_type, size_bytes}] — one attachment
+--   set per campaign, uploaded via POST /api/attachments (KV-stored),
+--   resolved per recipient by the shared send engine (lib/service-send.ts).
+--   Caps are enforced at campaign creation in lib/bulk.ts
+--   (validateBulkAttachments): 2 MB per file, 1 MB total per message
+--   (SendPulse free-tier message-size cap).
+ALTER TABLE bulk_campaigns ADD COLUMN personalized INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE bulk_campaigns ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';
