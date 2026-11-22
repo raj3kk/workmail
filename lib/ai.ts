@@ -777,6 +777,11 @@ export async function maybeAutoReply(input: {
         provider: exec.provider,
         sent_at: sentAt,
       });
+      // The sent copy is the record: drop the draft row so a sent
+      // auto-reply does not linger in Drafts (2026-11-22: the
+      // "Re: Thanks for the quick setup" draft stayed in Drafts after
+      // the reply was sent).
+      await dbRun('DELETE FROM messages WHERE id = ? AND workspace_id = ? AND folder = ?', [draftId, input.workspaceId, 'drafts']).catch(() => {});
       await setThreadMarker(input.mailboxId, threadKey, {
         source_message_id: input.messageId,
         draft_id: draftId,
