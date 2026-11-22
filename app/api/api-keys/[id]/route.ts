@@ -16,8 +16,9 @@ export async function DELETE(req: Request, {params}: {params: {id: string}}) {
   const row = rows[0];
   if (!row) return NextResponse.json({error: 'API key not found.'}, {status: 404});
   const role = await workspaceRole(user.id, String(row.workspace_id));
+  // P-02: 404 (not 403) on denial — see DELETE /api/api-keys.
   if (role !== 'owner' && role !== 'admin')
-    return NextResponse.json({error: 'Only workspace owners and admins can revoke API keys.'}, {status: 403});
+    return NextResponse.json({error: 'API key not found.'}, {status: 404});
   if (row.revoked_at) return NextResponse.json({revoked: true, already_revoked: true});
   await dbRun('UPDATE api_keys SET revoked_at = ? WHERE id = ?', [nowIso(), params.id]);
   return NextResponse.json({revoked: true});
