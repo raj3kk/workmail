@@ -69,6 +69,7 @@ import {executeSend, resolveFromName} from '@/lib/service-send';
 import type {ExecuteSendInput, SendAttachmentRef} from '@/lib/service-send';
 import {MAX_ATTACHMENT_COUNT, isSuppressed} from '@/lib/providers';
 import {
+  brandTemplateHtml,
   buildUnsubscribeMailto,
   getTemplate,
   htmlToText,
@@ -1059,6 +1060,10 @@ async function advanceCampaignClaimed(
           await setRecipient(recipientId, {status: 'failed', error: reason}, claimToken);
           continue;
         }
+        // Branded header (2026-11-22): same as executeSend — custom
+        // templates carry no logo header; wrap when the rendered HTML
+        // lacks one. Defaults already contain it and are skipped.
+        html = brandTemplateHtml(html, bulkFromName);
       } else {
         // Manual message (Bulk v2): strict per-recipient render. In
         // PERSONALIZED mode {{name}}/{{email}}/CSV columns resolve per
