@@ -31,7 +31,7 @@ export async function GET(req: Request) {
   const total = Number(totalRows[0]?.c || 0);
   // Same Wave 2 migration fallback as the list route (see there).
   const searchSql = (withImportant: boolean) =>
-    `SELECT id, from_email, to_email, subject, text_body, folder, is_read, is_starred, ${
+    `SELECT id, from_email, to_email, subject, text_body, folder, is_read, is_starred, delivery_state, provider, ${
       withImportant ? 'is_important, ' : ''
     }thread_id, received_at
      FROM messages WHERE ${where}
