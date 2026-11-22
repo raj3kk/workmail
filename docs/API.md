@@ -139,7 +139,7 @@ console.log(res.status, data);
 | `subject` | string, max 998 chars | Yes | Subject line. |
 | `text` | string, max 100,000 chars | One of `text` / `html` | Plain-text body. |
 | `html` | string, max 200,000 chars | One of `text` / `html` | HTML body. |
-| `provider` | string | No, default `"auto"` | `"auto"` (fallback chain) or `"sendpulse"`, `"brevo"`, `"mailjet"`, `"resend"`. A manual pick only works if that provider is enabled and sender-verified for the workspace. |
+| `provider` | string | No, default `"auto"` | `"auto"` (fallback chain: Brevo → Mailjet → Resend) or `"sendpulse"`, `"brevo"`, `"mailjet"`, `"resend"`. A manual pick only works if that provider is enabled and sender-verified for the workspace. **SendPulse is manual-only** (never in the Auto chain) and also requires the From mailbox to be in its verified-sender list, otherwise the send is rejected with 409 before any provider call. |
 | `mailbox_id` | string (UUID) | No | Which mailbox the mail comes FROM. Get IDs from `GET /api/v1/mailboxes`. Omit for the workspace default mailbox. |
 | `thread_id` | string (UUID) | No | Replying: the thread to join (from a listed message). Omit for a new mail. |
 | `in_reply_to` | string, max 998 chars | No | Replying: the Message-ID of the mail being answered (the listed message's `message_id`). Omit for a new mail. |
@@ -396,7 +396,7 @@ status. What each status means in plain words, and what to do:
 | 401 | Key missing, malformed, revoked, or expired. Session cookies and other tokens are never accepted here. | Check the `Authorization: Bearer …` header. Create a new key in Settings → API keys if yours was revoked or expired. |
 | 403 | Key is valid but lacks the scope for this endpoint, or the `mailbox_id` does not belong to the key's workspace. | Create a key with the right scope, or get the mailbox ID from `GET /api/v1/mailboxes`. Do not guess IDs. |
 | 404 | Something referenced was not found — e.g. an attachment ID that does not belong to your workspace, or a wrong URL. | Check the ID / URL. A foreign ID and a nonexistent ID give the same 404 on purpose, so you cannot probe for other workspaces' data. |
-| 409 | The request conflicts with the current state: recipient suppressed, monthly sending limit reached, domain not verified, or an idempotency key reused with different content. | Read the error text: remove the recipient from suppression (or pick another), wait for next month, verify the domain, or use a fresh idempotency key. Retrying the same request will not help. |
+| 409 | The request conflicts with the current state: recipient suppressed, monthly sending limit reached, domain not verified, an idempotency key reused with different content, or a manual provider pick that is not enabled/sender-verified — including a manual SendPulse pick from a mailbox that is not a verified SendPulse sender. | Read the error text: remove the recipient from suppression (or pick another), wait for next month, verify the domain, use a fresh idempotency key, or pick Auto / a verified mailbox. Retrying the same request will not help. |
 | 413 | Too big — request body over 2 MB, or attachments over the caps (1 MB total, 2 MB per file). | Shrink the mail: smaller attachments, or fewer of them. Nothing was sent. |
 | 429 | Per-key rate limit — too many requests too fast. The response carries a `Retry-After` header with the seconds to wait. | Wait the `Retry-After` seconds, then retry. See the limits below. |
 | 202 | Not an error, but not a success either: the provider timed out, so WorkMail does not know whether the mail went out. | Do NOT resend blindly — check `GET /api/v1/messages` for the delivery state first, or the mail may go out twice. |
@@ -411,7 +411,7 @@ Nothing here is unlimited.
 | Send rate (per API key) | 30 sends / minute | 429 with `Retry-After` — wait and retry. |
 | List / mailbox rate (per API key) | 120 requests / minute | 429 with `Retry-After` — wait and retry. |
 | Monthly sends (per workspace) | 300 sends / month | Further sends rejected with 409 until next month. |
-| SendPulse (free plan) | 50 / hour, 400 / day, 1 MB max message size | Auto mode falls through to the next provider; a manual SendPulse pick is rejected once capped. |
+| SendPulse (free plan) | 50 / hour, 400 / day, 1 MB max message size | Manual-only — never tried by Auto. A manual pick is rejected with 409 if the From mailbox is not a verified SendPulse sender, or once capped. |
 | Brevo (free plan) | 300 / day | Same fallback behaviour. |
 | Mailjet (free plan) | 200 / day | Same fallback behaviour. |
 | Resend (free plan) | 100 / day | Same fallback behaviour. |
