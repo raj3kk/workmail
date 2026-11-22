@@ -56,9 +56,17 @@
 import {createHash} from 'node:crypto';
 import {inflateRawSync} from 'node:zlib';
 import {dbOne, dbQuery, dbRun, jparse, jstr, newId, nowIso} from '@/lib/db';
-import {executeSend} from '@/lib/service-send';
+import {executeSend, resolveFromName} from '@/lib/service-send';
 import type {ExecuteSendInput} from '@/lib/service-send';
 import {isSuppressed} from '@/lib/providers';
+import {
+  buildUnsubscribeMailto,
+  getTemplate,
+  htmlToText,
+  renderTemplateHtml,
+  renderTemplateText,
+  UnknownTemplateVariableError,
+} from '@/lib/templates';
 
 /** Free-tier per-campaign recipient cap. Enforced in code (parse + create) and documented in docs/BULK-MESSAGING.md. */
 export const BULK_MAX_RECIPIENTS = 500;
@@ -483,6 +491,8 @@ export interface BulkCampaignSummary {
   status: string;
   /** 'auto' (fallback chain) or one provider name; stored on the campaign row, carried to executeSend. */
   provider: string;
+  /** Template rendered per recipient at send time, or null for a plain campaign. */
+  template_id: string | null;
   total_recipients: number;
   sent: number;
   failed: number;
@@ -512,6 +522,7 @@ export async function getBulkCampaignSummary(campaignId: string): Promise<BulkCa
     subject: String(c.subject || ''),
     status: String(c.status),
     provider: typeof c.provider === 'string' && c.provider ? String(c.provider) : 'auto',
+    template_id: c.template_id ? String(c.template_id) : null,
     total_recipients: Number(c.total_recipients),
     sent: byStatus['sent'] || 0,
     failed: byStatus['failed'] || 0,
@@ -726,6 +737,29 @@ async function advanceCampaignClaimed(
     campaign.provider === 'resend'
       ? campaign.provider
       : 'auto';
+  // Template (Phase 1): when the campaign carries a template_id, the
+  // stored template is rendered per recipient at send time (server-side
+  // only). A template deleted after campaign creation fails the
+  // campaign honestly instead of sending plain content.
+  const campaignTemplate = campaign.template_id
+    ? await getTemplate(String(campaign.workspace_id), String(campaign.template_id))
+    : null;
+  if (campaign.template_id && !campaignTemplate) {
+    await dbRun(
+      `UPDATE bulk_campaigns SET status = 'failed', pause_reason = ?, finished_at = ?, updated_at = ? WHERE id = ?`,
+      ['The campaign template was deleted after the campaign was created.', nowIso(), nowIso(), campaignId],
+    );
+    const summary = await getBulkCampaignSummary(campaignId);
+    if (!summary) throw new Error('Campaign not found.');
+    return summary;
+  }
+  const bulkFromName = await resolveFromName(String(campaign.workspace_id), {
+    id: String(sender.id),
+    address: String(sender.address),
+    display_name: sender.display_name ? String(sender.display_name) : null,
+    domain_id: String(sender.domain_id),
+  });
+  const bulkUnsubscribeUrl = buildUnsubscribeMailto(String(sender.address));
   for (const rec of recipients) {
     // Stop check before every recipient — the stop route flips this row.
     const live = await dbOne('SELECT status FROM bulk_campaigns WHERE id = ?', [campaignId]);
@@ -753,9 +787,42 @@ async function advanceCampaignClaimed(
         );
         continue;
       }
-      const subject = renderTemplate(String(campaign.subject || ''), recipient);
-      const text = renderTemplate(String(campaign.text_body || ''), recipient);
-      const html = renderTemplate(String(campaign.html_body || ''), recipient);
+      let subject: string;
+      let text: string;
+      let html: string;
+      if (campaignTemplate) {
+        // Template render per recipient (strict): the recipient's own
+        // columns + email/name + sender_name + unsubscribe_url are the
+        // context. A variable the recipient cannot supply (e.g. {{otp}})
+        // was already rejected at campaign creation; if one still shows
+        // up, the recipient fails honestly with the reason — never an
+        // empty render, never a skipped send.
+        const ctx: Record<string, string> = {
+          email,
+          name: String(rec.name || ''),
+          ...recipient.fields,
+          sender_name: bulkFromName,
+          unsubscribe_url: bulkUnsubscribeUrl,
+        };
+        try {
+          subject = renderTemplateText(campaignTemplate.subject, ctx, true);
+          html = renderTemplateHtml(campaignTemplate.html_body, ctx, true);
+          text = campaignTemplate.text_body
+            ? renderTemplateText(campaignTemplate.text_body, ctx, true)
+            : htmlToText(html);
+        } catch (e) {
+          const reason =
+            e instanceof UnknownTemplateVariableError
+              ? e.message
+              : 'Template render failed.';
+          await setRecipient(recipientId, {status: 'failed', error: reason}, claimToken);
+          continue;
+        }
+      } else {
+        subject = renderTemplate(String(campaign.subject || ''), recipient);
+        text = renderTemplate(String(campaign.text_body || ''), recipient);
+        html = renderTemplate(String(campaign.html_body || ''), recipient);
+      }
       // executeSend's `provider` input ('auto' = fallback chain, or a
       // single provider name). The send engine validates a manual pick
       // (enabled + sender-verified) before calling any provider.
@@ -773,6 +840,9 @@ async function advanceCampaignClaimed(
         html: html || undefined,
         idempotencyKey: String(rec.idempotency_key),
         provider: campaignProvider,
+        // Every bulk send carries the List-Unsubscribe header + footer
+        // link (added in executeSend from this address).
+        unsubscribeUrl: bulkUnsubscribeUrl,
       };
       const exec = await executeSend(sendInput, {
         kind: 'user',
