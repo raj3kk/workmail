@@ -73,7 +73,7 @@ export async function POST(req: Request) {
     try {
       await kvPut(key, bytes, file.type);
     } catch (e) {
-      return NextResponse.json({error: 'Storage upload failed', detail: e instanceof Error ? e.message : 'KV error'}, {status: 502});
+      return NextResponse.json({error: 'Storage upload failed'}, {status: 502});
     }
     if (messageId) {
       try {
@@ -92,7 +92,7 @@ export async function POST(req: Request) {
       attachment: {file_name: safe, content_type: file.type, size_bytes: file.size, object_key: key, message_id: messageId || null},
     });
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Upload failed'}, {status: 500});
+    return NextResponse.json({error: 'Upload failed'}, {status: 500});
   }
 }
 
@@ -106,8 +106,11 @@ export async function GET(req: Request) {
   if (!id || !workspaceId) return NextResponse.json({error: 'id and workspace_id required'}, {status: 400});
   const att = await dbOne('SELECT * FROM message_attachments WHERE id = ? AND workspace_id = ?', [id, workspaceId]);
   if (!att) return NextResponse.json({error: 'Attachment not found'}, {status: 404});
+  // P-02: 404 (not 403) on denial — the attachment was already found
+  // by id + workspace_id above, so a 403 would confirm to a non-member
+  // that this attachment id exists in that workspace.
   if (!(await authorized(String(att.mailbox_id), user.id, workspaceId, false)))
-    return NextResponse.json({error: 'Mailbox access denied'}, {status: 403});
+    return NextResponse.json({error: 'Attachment not found'}, {status: 404});
   let bytes: Buffer | null;
   try {
     bytes = await kvGet(String(att.object_key));
