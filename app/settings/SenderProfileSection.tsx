@@ -1,6 +1,7 @@
 "use client";
 import {useCallback, useEffect, useState} from "react";
 import ProfilePhotoSection from "./ProfilePhotoSection";
+import {SENDER_PROFILE_STEPS as WIZARD_STEPS} from "@/lib/sender-profile";
 
 // Settings → Sender profile (S1, §15.1).
 // One block per mailbox, rendered from the LIVE mailbox list — never
@@ -19,59 +20,8 @@ import ProfilePhotoSection from "./ProfilePhotoSection";
 //       step. A step is done only when the user ticks it.
 //   (d) plain-language explanation of what recipients see / don't see.
 //
-// WIZARD_STEPS step_key values must match STEP_KEYS in
-// app/api/sender-profile/checklist/route.ts and the comment in
-// db/migrations/0009_sender_profile.sql.
-
-type WizardStep = {key: string; title: string; detail: (address: string) => string};
-
-const WIZARD_STEPS: WizardStep[] = [
-  {
-    key: "open_google_account",
-    title: "Open myaccount.google.com",
-    detail: () =>
-      "Sign in with the Google Account whose photo you want recipients to see. That account's photo is what shows for every address linked to it.",
-  },
-  {
-    key: "personal_info",
-    title: "Open Personal info",
-    detail: () => "On the left menu (or the top tabs on mobile), open “Personal info”.",
-  },
-  {
-    key: "email_section",
-    title: "Open Email",
-    detail: () => "Under “Contact info”, open “Email”. This shows your Google Account email and alternate emails.",
-  },
-  {
-    key: "alternate_emails",
-    title: "Open Alternate emails",
-    detail: () => "Find the “Alternate emails” section on the Email page.",
-  },
-  {
-    key: "add_address",
-    title: "Add alternate email — enter this mailbox address",
-    detail: (address) =>
-      `Click “Add alternate email” and enter exactly this address: ${address}. Then save. Google will send a verification mail to this address.`,
-  },
-  {
-    key: "find_verification_mail",
-    title: "Find Google's verification mail in this mailbox's WorkMail inbox",
-    detail: () =>
-      "Open the WorkMail inbox, switch to this mailbox, and look for Google's verification message (subject mentions verifying your email address).",
-  },
-  {
-    key: "click_verify_link",
-    title: "Click the verification link (or enter the code)",
-    detail: () =>
-      "Open Google's mail and click its verification link — or copy the verification code from the mail into the Google page, if it asks for a code instead.",
-  },
-  {
-    key: "approve_phone_prompt",
-    title: "Approve the prompt on your signed-in phone, if Google asks",
-    detail: () =>
-      "Google may ask you to confirm on your signed-in phone (“Yes, it's me”). Approve it there. If no prompt appears, this step is already done — tick it.",
-  },
-];
+// Wizard steps: single source of truth is lib/sender-profile.ts
+// (SENDER_PROFILE_STEPS, imported above as WIZARD_STEPS).
 
 const TOTAL_STEPS = WIZARD_STEPS.length;
 
