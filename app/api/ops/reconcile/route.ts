@@ -46,7 +46,7 @@ export async function POST(req: Request) {
       success: false,
       stale_jobs_reviewed: reset,
       retry: null,
-      error: `Retry worker failed: ${e instanceof Error ? e.message : 'unknown error'}`,
+      error: 'Retry worker failed — check the server logs and retry on the next tick.',
       note: 'Stale ambiguous sends were still flagged above; retry consumption failed and will be attempted on the next tick.',
     });
   }
