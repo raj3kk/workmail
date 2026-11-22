@@ -2,6 +2,7 @@ import {NextResponse} from 'next/server';
 import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
 import {canAccessMailbox, isValidOrigin, requireUser} from '@/lib/guards';
 import {withRateLimit, RATE_LIMIT_DEFAULTS} from '@/lib/rate-limit';
+import {SENDER_PROFILE_STEP_KEYS as STEP_KEYS} from '@/lib/sender-profile';
 
 // Sender profile — user-confirmed Google alternate-email checklist (S1, §15.1).
 // GET  /api/sender-profile/checklist?mailbox_id=<id>
@@ -13,20 +14,8 @@ import {withRateLimit, RATE_LIMIT_DEFAULTS} from '@/lib/rate-limit';
 // auto-verified, or inferred. Ticking a step stores one row in
 // sender_profile_steps (migration 0009); unticking deletes it.
 //
-// STEP_KEYS must match the WIZARD_STEPS list in
-// app/settings/SenderProfileSection.tsx and the step_key comment in
-// db/migrations/0009_sender_profile.sql.
-
-const STEP_KEYS = [
-  'open_google_account',
-  'personal_info',
-  'email_section',
-  'alternate_emails',
-  'add_address',
-  'find_verification_mail',
-  'click_verify_link',
-  'approve_phone_prompt',
-] as const;
+// Step keys: single source of truth is lib/sender-profile.ts
+// (SENDER_PROFILE_STEP_KEYS, imported above as STEP_KEYS).
 
 function missingTable(e: unknown): boolean {
   return e instanceof Error && /no such table/i.test(e.message);
