@@ -38,6 +38,10 @@ const createSchema = z
     text: z.string().max(100000).optional().default(''),
     html: z.string().max(200000).optional().default(''),
     recipients: z.array(recipientSchema).min(1).max(BULK_MAX_RECIPIENTS),
+    // Per-campaign provider choice (F3): 'auto' = fallback chain, or one
+    // provider name = ONLY that provider, no silent fallback (enforced
+    // in the send engine). Stored on the campaign row.
+    provider: z.enum(['auto', 'sendpulse', 'brevo', 'mailjet', 'resend']).optional().default('auto'),
   })
   .refine((x) => !!(x.text || x.html), {message: 'Provide a text body, an HTML body, or both.'});
 
@@ -125,9 +129,9 @@ export async function POST(req: Request) {
   const campaignId = newId();
   const now = nowIso();
   await dbRun(
-    `INSERT INTO bulk_campaigns (id, workspace_id, mailbox_id, created_by, name, subject, text_body, html_body, status, total_recipients, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`,
-    [campaignId, d.workspace_id, d.mailbox_id, user.id, d.name, d.subject, d.text, d.html, valid.length, now, now],
+    `INSERT INTO bulk_campaigns (id, workspace_id, mailbox_id, created_by, name, subject, text_body, html_body, provider, status, total_recipients, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`,
+    [campaignId, d.workspace_id, d.mailbox_id, user.id, d.name, d.subject, d.text, d.html, d.provider, valid.length, now, now],
   );
   for (const r of valid) {
     await dbRun(
