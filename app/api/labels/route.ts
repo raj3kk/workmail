@@ -45,7 +45,7 @@ export async function POST(req: Request) {
       ],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not create label'}, {status: 400});
+    return NextResponse.json({error: 'Could not create label'}, {status: 400});
   }
   const label = await dbOne('SELECT * FROM labels WHERE id = ?', [id]);
   return NextResponse.json({label});
@@ -60,8 +60,10 @@ export async function DELETE(req: Request) {
   const label = await dbOne('SELECT workspace_id FROM labels WHERE id = ?', [b.id]);
   if (!label) return NextResponse.json({error: 'Label not found'}, {status: 404});
   const role = await workspaceRole(user.id, String(label.workspace_id));
+  // P-02: 404 (not 403) on denial, so a cross-tenant label-id probe
+  // cannot confirm another tenant's label exists by the status code.
   if (!role || !['owner', 'admin'].includes(role))
-    return NextResponse.json({error: 'Workspace admin required'}, {status: 403});
+    return NextResponse.json({error: 'Label not found'}, {status: 404});
   // message_labels rows cascade via FK; delete the label itself.
   await dbRun('DELETE FROM message_labels WHERE label_id = ?', [b.id]);
   await dbRun('DELETE FROM labels WHERE id = ?', [b.id]);
