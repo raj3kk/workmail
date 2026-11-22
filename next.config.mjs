@@ -19,6 +19,11 @@ const nextConfig = {
             value: 'max-age=63072000; includeSubDomains; preload',
           },
           {
+            // NOTE (G-17): nonce-based CSP was attempted in middleware
+            // and reverted — see docs/SECURITY.md. The pages are
+            // statically prerendered, so a per-request nonce cannot be
+            // stamped onto their inline scripts; a nonce policy would
+            // block the RSC payload. script-src stays 'unsafe-inline'.
             key: 'Content-Security-Policy',
             value: [
               "default-src 'self'",
