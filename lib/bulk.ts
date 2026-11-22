@@ -18,6 +18,15 @@
 // in-flight send finishes). Already-sent recipients stay `sent`; the
 // rest stay `pending`.
 //
+// Bulk v2 (E3 + E5-5, migration 0008): the engine above is unchanged.
+// Added: paste-a-list parsing (parsePastedRecipients), an interim
+// disposable-domain blocklist (Phase 3b G-12 centralises it), strict
+// manual-message rendering (renderTemplateStrict), campaign attachments
+// (validateBulkAttachments, 2 MB/file + 1 MB total), and the
+// `personalized` flag (SAME vs per-recipient). Campaign creation
+// (app/api/bulk/campaigns/route.ts) enforces all of it; the runner only
+// renders strictly and passes the stored attachment refs through.
+//
 // Safety invariants:
 //   - Per-campaign recipient cap BULK_MAX_RECIPIENTS (500, free tier).
 //   - Suppressed/unsubscribed addresses are excluded at preview time
@@ -57,8 +66,8 @@ import {createHash} from 'node:crypto';
 import {inflateRawSync} from 'node:zlib';
 import {dbOne, dbQuery, dbRun, jparse, jstr, newId, nowIso} from '@/lib/db';
 import {executeSend, resolveFromName} from '@/lib/service-send';
-import type {ExecuteSendInput} from '@/lib/service-send';
-import {isSuppressed} from '@/lib/providers';
+import type {ExecuteSendInput, SendAttachmentRef} from '@/lib/service-send';
+import {MAX_ATTACHMENT_COUNT, isSuppressed} from '@/lib/providers';
 import {
   buildUnsubscribeMailto,
   getTemplate,
@@ -94,6 +103,234 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
 export function isValidEmail(email: string): boolean {
   return email.length <= 254 && EMAIL_RE.test(email);
+}
+
+// ---------------------------------------------------------------------------
+// Bulk v2 — pasted recipient lists, disposable domains, strict manual
+// rendering, campaign attachments (E3 + E5-5).
+// ---------------------------------------------------------------------------
+
+/** Per-file attachment cap for bulk campaigns (2 MB/file discipline). */
+export const BULK_MAX_ATTACHMENT_FILE_BYTES = 2 * 1024 * 1024;
+/** Total attachments per message in a bulk campaign (1 MB — the SendPulse
+ *  free-tier message-size cap; enforced at creation and shown honestly
+ *  in the UI. The shared engine's 10 MB cap still applies underneath.) */
+export const BULK_MAX_TOTAL_ATTACHMENT_BYTES = 1 * 1024 * 1024;
+/** Variables a bulk campaign can never supply (no per-recipient value
+ *  exists for them). Rejected at campaign creation, same as templates. */
+export const BULK_UNSUPPLIABLE_VARIABLES = ['otp', 'action_url'] as const;
+
+/**
+ * INTERIM disposable/temp-mail domain blocklist (Bulk v2, 2026-11-22).
+ * Phase 3b's G-12 owns the central `lib/email-validation.ts` (~100
+ * domains, applied at invite/contacts/bulk); it does not exist yet, so
+ * bulk carries this top-~40 list locally and Phase 3b will centralise
+ * it. Do NOT add a second shared lib file for this — the central one
+ * replaces this list when it lands. The bulk page duplicates this list
+ * for its live client-side parse (lib/bulk.ts is server-only: it
+ * imports node:crypto/node:zlib and @/lib/db, so the client cannot
+ * import it); keep the two copies in sync until G-12 lands.
+ */
+export const DISPOSABLE_DOMAINS: readonly string[] = [
+  '10minutemail.com',
+  'anonymbox.com',
+  'bugmenot.com',
+  'deadaddress.com',
+  'dispostable.com',
+  'dropmail.me',
+  'emailfake.com',
+  'emailondeck.com',
+  'fakeinbox.com',
+  'filzmail.com',
+  'getnada.com',
+  'guerrillamail.com',
+  'guerrillamailblock.com',
+  'incognitomail.com',
+  'jetable.org',
+  'kasmail.com',
+  'mailcatch.com',
+  'maildrop.cc',
+  'mailinator.com',
+  'mailmetrash.com',
+  'mailnesia.com',
+  'mintemail.com',
+  'mohmal.com',
+  'mytemp.email',
+  'nobulk.com',
+  'nurfuerspam.de',
+  'pookmail.com',
+  'sharklasers.com',
+  'shitmail.me',
+  'spambox.us',
+  'spamgourmet.com',
+  'temp-mail.io',
+  'temp-mail.org',
+  'tempail.com',
+  'tempinbox.com',
+  'tempmail.com',
+  'tempmailaddress.com',
+  'tmpmail.org',
+  'trash-mail.com',
+  'trashmail.com',
+  'throwawaymail.com',
+  'yopmail.com',
+];
+
+export function isDisposableDomain(email: string): boolean {
+  const domain = email.trim().toLowerCase().split('@')[1] || '';
+  return DISPOSABLE_DOMAINS.includes(domain);
+}
+
+export interface PastedListResult {
+  /** Valid, deduped recipients (name empty unless `Name <email>` was pasted). */
+  recipients: ParsedRecipient[];
+  totalTokens: number;
+  invalid: Array<{row: number; email: string; reason: 'invalid_email' | 'disposable_domain'}>;
+  duplicatesRemoved: number;
+  disposableRejected: Array<{email: string}>;
+  suppressed: Array<{email: string; reason: string}>;
+}
+
+/**
+ * Parse a pasted recipient list: addresses separated by newlines, commas
+ * or semicolons; `Name <email@example.com>` is also accepted (the name is
+ * kept for {{name}}). Invalid lines are REPORTED (never silently
+ * dropped), duplicates are de-duplicated (first wins), disposable
+ * domains are rejected, suppressed addresses are excluded — the same
+ * order of checks as validateRecipients, so paste and file flows agree.
+ * `row` is the 1-based position of the token in the pasted list.
+ */
+export function parsePastedRecipients(
+  text: string,
+  suppressed: Map<string, string>,
+): PastedListResult {
+  const tokens = text
+    .split(/[\n,;]+/)
+    .map((t) => t.trim())
+    .filter((t) => t !== '');
+  const recipients: ParsedRecipient[] = [];
+  const invalid: PastedListResult['invalid'] = [];
+  const disposableRejected: Array<{email: string}> = [];
+  const suppressedOut: Array<{email: string; reason: string}> = [];
+  const seen = new Set<string>();
+  let duplicatesRemoved = 0;
+  tokens.forEach((token, idx) => {
+    const row = idx + 1;
+    // `Name <email>` form: take the address in brackets, keep the name.
+    const angled = /^(.*)<\s*([^<>\s]+)\s*>$/.exec(token);
+    const name = angled ? angled[1].trim().replace(/^["']|["']$/g, '') : '';
+    const email = (angled ? angled[2] : token).trim().toLowerCase();
+    if (!email || !isValidEmail(email)) {
+      invalid.push({row, email: token, reason: 'invalid_email'});
+      return;
+    }
+    if (isDisposableDomain(email)) {
+      invalid.push({row, email, reason: 'disposable_domain'});
+      disposableRejected.push({email});
+      return;
+    }
+    if (seen.has(email)) {
+      duplicatesRemoved += 1;
+      return;
+    }
+    seen.add(email);
+    const reason = suppressed.get(email);
+    if (reason !== undefined) {
+      suppressedOut.push({email, reason});
+      return;
+    }
+    recipients.push({email, name, fields: {}, row});
+  });
+  return {
+    recipients,
+    totalTokens: tokens.length,
+    invalid,
+    duplicatesRemoved,
+    disposableRejected,
+    suppressed: suppressedOut,
+  };
+}
+
+/** Thrown by renderTemplateStrict when a recipient cannot supply a variable. */
+export class BulkRenderError extends Error {
+  variables: string[];
+  constructor(variables: string[]) {
+    super(
+      `Message uses variable(s) this recipient cannot supply: ${variables.map((v) => `{{${v}}}`).join(', ')}. Values are never guessed or dropped silently.`,
+    );
+    this.name = 'BulkRenderError';
+    this.variables = variables;
+  }
+}
+
+/**
+ * Strict per-recipient render for MANUAL bulk messages (E3): every
+ * {{variable}} must have a value in the recipient context (email, name,
+ * CSV columns) or the automatic context (sender_name,
+ * unsubscribe_url). An unknown variable throws BulkRenderError so the
+ * runner fails THAT recipient honestly — never an empty render, never
+ * a skipped send. (The non-strict renderTemplate above stays for
+ * previews, where unknown variables render empty with a warning.)
+ */
+export function renderTemplateStrict(
+  template: string,
+  recipient: ParsedRecipient,
+  extra: Record<string, string>,
+): string {
+  const ctx: Record<string, string> = {
+    email: recipient.email,
+    name: recipient.name,
+    ...recipient.fields,
+    ...extra,
+  };
+  const unknown = findUnknownPlaceholders(template, Object.keys(ctx));
+  if (unknown.length > 0) throw new BulkRenderError(unknown);
+  return renderTemplate(template, recipient);
+}
+
+/**
+ * Validate a campaign's attachment set (E5-5) BEFORE creation: one set
+ * per campaign, uploaded via POST /api/attachments (KV-stored, no
+ * message_id — the object_key form). Ownership is proven by the KV key
+ * prefix `att/<workspaceId>/<mailboxId>/` (same proof the send engine
+ * requires). Per-file ≤ 2 MB, total ≤ 1 MB (SendPulse free-tier cap),
+ * at most MAX_ATTACHMENT_COUNT files. Returns the total bytes on success
+ * so the caller can show the honest "X KB of 1 MB" state.
+ */
+export function validateBulkAttachments(
+  refs: SendAttachmentRef[],
+  workspaceId: string,
+  mailboxId: string,
+): {ok: true; totalBytes: number} | {ok: false; error: string} {
+  if (!Array.isArray(refs)) return {ok: false, error: 'Attachments must be a list.'};
+  if (refs.length > MAX_ATTACHMENT_COUNT)
+    return {ok: false, error: `Too many attachments (max ${MAX_ATTACHMENT_COUNT} per campaign).`};
+  const keyPrefix = `att/${workspaceId}/${mailboxId}/`;
+  let total = 0;
+  for (const r of refs) {
+    if (r.attachment_id)
+      return {
+        ok: false,
+        error: 'Bulk campaigns use freshly uploaded attachments (object_key form). Re-upload the file on the bulk page.',
+      };
+    const key = String(r.object_key || '');
+    if (!key.startsWith(keyPrefix))
+      return {ok: false, error: 'Attachment not found for this mailbox.'};
+    if (!r.file_name || typeof r.size_bytes !== 'number')
+      return {ok: false, error: 'Each attachment needs a file_name and size_bytes.'};
+    if (r.size_bytes < 1 || r.size_bytes > BULK_MAX_ATTACHMENT_FILE_BYTES)
+      return {
+        ok: false,
+        error: `Attachment "${r.file_name}" exceeds the 2 MB per-file limit for bulk sends.`,
+      };
+    total += r.size_bytes;
+  }
+  if (total > BULK_MAX_TOTAL_ATTACHMENT_BYTES)
+    return {
+      ok: false,
+      error: `Attachments total ${Math.round(total / 1024)} KB — over the 1 MB per-message limit for bulk sends (SendPulse free tier). Remove a file or use a smaller one.`,
+    };
+  return {ok: true, totalBytes: total};
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +730,10 @@ export interface BulkCampaignSummary {
   provider: string;
   /** Template rendered per recipient at send time, or null for a plain campaign. */
   template_id: string | null;
+  /** Bulk v2: true = per-recipient rendering ({{name}}, {{email}}, CSV columns); false = SAME, one identical body for everyone. */
+  personalized: boolean;
+  /** Bulk v2 (E5-5): one attachment set per campaign (SendAttachmentRef list, object_key form), or [] for none. */
+  attachments: SendAttachmentRef[];
   total_recipients: number;
   sent: number;
   failed: number;
@@ -523,6 +764,10 @@ export async function getBulkCampaignSummary(campaignId: string): Promise<BulkCa
     status: String(c.status),
     provider: typeof c.provider === 'string' && c.provider ? String(c.provider) : 'auto',
     template_id: c.template_id ? String(c.template_id) : null,
+    // Columns added by migration 0008; a row predating it reads as
+    // personalized with no attachments (the pre-v2 behaviour).
+    personalized: c.personalized === undefined || c.personalized === null ? true : Number(c.personalized) === 1,
+    attachments: jparse<SendAttachmentRef[]>(typeof c.attachments === 'string' ? c.attachments : '[]', []),
     total_recipients: Number(c.total_recipients),
     sent: byStatus['sent'] || 0,
     failed: byStatus['failed'] || 0,
@@ -753,6 +998,14 @@ async function advanceCampaignClaimed(
     if (!summary) throw new Error('Campaign not found.');
     return summary;
   }
+  // Campaign attachments (Bulk v2, E5-5): one set per campaign, stored
+  // as JSON on the row, resolved per recipient by the shared send
+  // engine. Caps (2 MB/file, 1 MB total) were enforced at creation;
+  // a missing KV object fails each recipient honestly via executeSend.
+  const campaignAttachments = jparse<SendAttachmentRef[]>(
+    typeof campaign.attachments === 'string' ? campaign.attachments : '[]',
+    [],
+  );
   const bulkFromName = await resolveFromName(String(campaign.workspace_id), {
     id: String(sender.id),
     address: String(sender.address),
@@ -819,9 +1072,24 @@ async function advanceCampaignClaimed(
           continue;
         }
       } else {
-        subject = renderTemplate(String(campaign.subject || ''), recipient);
-        text = renderTemplate(String(campaign.text_body || ''), recipient);
-        html = renderTemplate(String(campaign.html_body || ''), recipient);
+        // Manual message (Bulk v2): strict per-recipient render. In
+        // PERSONALIZED mode {{name}}/{{email}}/CSV columns resolve per
+        // recipient; in SAME mode creation already rejected every
+        // per-recipient variable, so the same render produces one
+        // identical body for everyone. A variable no recipient can
+        // supply fails THIS recipient honestly (BulkRenderError) —
+        // never an empty render, never a skipped send.
+        try {
+          const manualCtx = {sender_name: bulkFromName, unsubscribe_url: bulkUnsubscribeUrl};
+          subject = renderTemplateStrict(String(campaign.subject || ''), recipient, manualCtx);
+          text = renderTemplateStrict(String(campaign.text_body || ''), recipient, manualCtx);
+          html = renderTemplateStrict(String(campaign.html_body || ''), recipient, manualCtx);
+        } catch (e) {
+          const reason =
+            e instanceof BulkRenderError ? e.message : 'Message render failed.';
+          await setRecipient(recipientId, {status: 'failed', error: reason}, claimToken);
+          continue;
+        }
       }
       // executeSend's `provider` input ('auto' = fallback chain, or a
       // single provider name). The send engine validates a manual pick
@@ -843,6 +1111,9 @@ async function advanceCampaignClaimed(
         // Every bulk send carries the List-Unsubscribe header + footer
         // link (added in executeSend from this address).
         unsubscribeUrl: bulkUnsubscribeUrl,
+        // Bulk v2 (E5-5): the campaign's one attachment set, same files
+        // for every recipient.
+        attachments: campaignAttachments.length > 0 ? campaignAttachments : undefined,
       };
       const exec = await executeSend(sendInput, {
         kind: 'user',
