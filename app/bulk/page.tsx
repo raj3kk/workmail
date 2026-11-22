@@ -141,6 +141,8 @@ export default function BulkPage() {
   const [aiBusy, setAiBusy] = useState(false);
   const [campaignName, setCampaignName] = useState("");
   const [provider, setProvider] = useState("auto");
+  // Provider verified-sender lists (SendPulse manual-only rule).
+  const [providers, setProviders] = useState<any[]>([]);
   const [campaign, setCampaign] = useState<Campaign | null>(null);
   const [recipients, setRecipients] = useState<RecipientRow[]>([]);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -165,6 +167,9 @@ export default function BulkPage() {
     fetch("/api/mailboxes").then((r) => r.json()).then((d) => {
       setMailboxes(d.data || []);
       if (!mailboxId && d.data?.[0]) setMailboxId(d.data[0].id);
+    }).catch(() => {});
+    fetch("/api/providers").then((r) => r.json()).then((d) => {
+      if (Array.isArray(d.providers)) setProviders(d.providers);
     }).catch(() => {});
   }, [user]);
   async function loadCampaigns() {
@@ -412,6 +417,20 @@ export default function BulkPage() {
   const attachTotal = attachFiles.reduce((s, a) => s + a.size_bytes, 0);
   const wsMailboxes = mailboxes.filter((b: any) => b.workspace_id === workspaceId);
   const activeMailbox = wsMailboxes.find((b: any) => b.id === mailboxId);
+  // SendPulse manual-only (owner order 2026-11-22): when SendPulse is
+  // the picked provider, only mailboxes in its verified_senders list
+  // may send. The server enforces the same rule with 409.
+  const sendpulseEligibleBoxes = (() => {
+    const row = providers.find((p: any) => p.provider === "sendpulse");
+    const list = Array.isArray(row?.verified_senders) ? row.verified_senders.map((s: string) => String(s).toLowerCase()) : [];
+    return wsMailboxes.filter((b: any) => list.includes(String(b.address).toLowerCase()));
+  })();
+  const visibleFromBoxes = provider === "sendpulse" ? sendpulseEligibleBoxes : wsMailboxes;
+  function onProviderChange(v: string) {
+    setProvider(v);
+    if (v === "sendpulse" && sendpulseEligibleBoxes.length && !sendpulseEligibleBoxes.some((b: any) => b.id === mailboxId))
+      setMailboxId(sendpulseEligibleBoxes[0].id);
+  }
 
   return (
     <main className="shell">
@@ -426,9 +445,10 @@ export default function BulkPage() {
         </select>
         <div className="navLabel">FROM MAILBOX</div>
         <select value={mailboxId} onChange={(e) => setMailboxId(e.target.value)}>
-          {wsMailboxes.map((b: any) => <option key={b.id} value={b.id}>{b.address}</option>)}
+          {visibleFromBoxes.map((b: any) => <option key={b.id} value={b.id}>{b.address}</option>)}
         </select>
         {wsMailboxes.length === 0 && <small className="muted">No mailbox in this workspace yet — create one in Settings first.</small>}
+        {provider === "sendpulse" && visibleFromBoxes.length === 0 && <small className="muted">SendPulse (manual-only): no verified sender in this workspace — verify a sender in Settings first.</small>}
         <div className="navLabel">PAST CAMPAIGNS</div>
         {campaigns.length === 0 && <small className="muted">No campaigns yet.</small>}
         {campaigns.map((c) => (
@@ -499,7 +519,7 @@ export default function BulkPage() {
             <h2>2 · Compose one message</h2>
             <label>Send from (mailbox)
               <select value={mailboxId} onChange={(e) => setMailboxId(e.target.value)} style={{width: "100%"}}>
-                {wsMailboxes.map((b: any) => <option key={b.id} value={b.id}>{b.address}{b.display_name ? ` (${b.display_name})` : ""}</option>)}
+                {visibleFromBoxes.map((b: any) => <option key={b.id} value={b.id}>{b.address}{b.display_name ? ` (${b.display_name})` : ""}</option>)}
               </select>
             </label>
             {activeMailbox && <small className="muted">Sends go from {activeMailbox.address}{activeMailbox.display_name ? ` as “${activeMailbox.display_name}”` : ""}.</small>}
@@ -568,7 +588,7 @@ export default function BulkPage() {
               </ul>
             )}
             <label>Provider
-              <select value={provider} onChange={(e) => setProvider(e.target.value)} style={{width: "100%"}}>
+              <select value={provider} onChange={(e) => onProviderChange(e.target.value)} style={{width: "100%"}}>
                 <option value="auto">Auto (fallback chain)</option>
                 <option value="sendpulse">SendPulse</option>
                 <option value="brevo">Brevo</option>
@@ -576,7 +596,7 @@ export default function BulkPage() {
                 <option value="resend">Resend</option>
               </select>
             </label>
-            <small className="muted">Auto tries providers in fallback order. A manual pick sends through ONLY that provider — no silent fallback; if it rejects, the send fails honestly.</small>
+            <small className="muted">Auto tries Brevo → Mailjet → Resend. SendPulse is manual-only — when picked, only its verified senders can send from it. A manual pick sends through ONLY that provider — no silent fallback; if it rejects, the send fails honestly.</small>
             {unknownInCompose.length > 0 && <div className="warn">Unknown placeholders — campaign creation will be blocked until these are fixed: {unknownInCompose.map((p) => `{{${p}}}`).join(", ")}</div>}
             {previewRecipient && messageMode === "manual" && (
               <div style={{marginTop: 8, border: "1px solid var(--hatch-widget-border, #ddd)", padding: 12, borderRadius: 8}}>
