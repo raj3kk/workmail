@@ -131,7 +131,7 @@ export async function POST(req: Request) {
     } catch (e) {
       return (
         secretErrorResponse(e) ||
-        NextResponse.json({error: e instanceof Error ? e.message : 'Upload failed'}, {status: 400})
+        NextResponse.json({error: 'Upload failed'}, {status: 400})
       );
     }
   }
@@ -161,7 +161,7 @@ export async function POST(req: Request) {
     } catch (e) {
       return (
         secretErrorResponse(e) ||
-        NextResponse.json({error: e instanceof Error ? e.message : 'Upload failed'}, {status: 400})
+        NextResponse.json({error: 'Upload failed'}, {status: 400})
       );
     }
   }
@@ -191,7 +191,7 @@ export async function POST(req: Request) {
     } catch (e) {
       return (
         secretErrorResponse(e) ||
-        NextResponse.json({error: e instanceof Error ? e.message : 'Could not save training entry'}, {status: 400})
+        NextResponse.json({error: 'Could not save training entry'}, {status: 400})
       );
     }
   }
@@ -226,7 +226,7 @@ export async function PATCH(req: Request) {
   } catch (e) {
     return (
       secretErrorResponse(e) ||
-      NextResponse.json({error: e instanceof Error ? e.message : 'Could not update training entry'}, {status: 400})
+      NextResponse.json({error: 'Could not update training entry'}, {status: 400})
     );
   }
 }
