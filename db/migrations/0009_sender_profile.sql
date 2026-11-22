@@ -8,9 +8,9 @@
 -- for adding an alternate email to a personal Google Account, so the app
 -- cannot see the user's Google Account and cannot verify any step itself.
 -- A step is done ONLY when the user ticks it in Settings → Sender profile.
--- step_key values (must match the WIZARD_STEPS list in
--- app/settings/SenderProfileSection.tsx and STEP_KEYS in
--- app/api/sender-profile/checklist/route.ts):
+-- step_key values: single source of truth is lib/sender-profile.ts
+-- (SENDER_PROFILE_STEPS / SENDER_PROFILE_STEP_KEYS). Do NOT copy the
+-- list anywhere else:
 --   open_google_account, personal_info, email_section, alternate_emails,
 --   add_address, find_verification_mail, click_verify_link,
 --   approve_phone_prompt
