@@ -416,7 +416,15 @@ CREATE TRIGGER IF NOT EXISTS messages_updated_at AFTER UPDATE ON messages FOR EA
 CREATE TRIGGER IF NOT EXISTS contacts_updated_at AFTER UPDATE ON contacts FOR EACH ROW BEGIN UPDATE contacts SET updated_at = datetime('now') WHERE id = NEW.id; END;
 CREATE TRIGGER IF NOT EXISTS subscriptions_updated_at AFTER UPDATE ON subscriptions FOR EACH ROW BEGIN UPDATE subscriptions SET updated_at = datetime('now') WHERE id = NEW.id; END;
 CREATE TRIGGER IF NOT EXISTS outbound_jobs_updated_at AFTER UPDATE ON outbound_jobs FOR EACH ROW BEGIN UPDATE outbound_jobs SET updated_at = datetime('now') WHERE id = NEW.id; END;
-CREATE TRIGGER IF NOT EXISTS idempotency_updated_at AFTER UPDATE ON idempotency_keys FOR EACH ROW BEGIN UPDATE idempotency_keys SET updated_at = datetime('now') WHERE id = NEW.id; END;
+-- NOTE (2026-11-22): the idempotency_updated_at trigger was REMOVED.
+-- It did `UPDATE idempotency_keys ... WHERE id = NEW.id`, but this table
+-- has NO `id` column (PK is workspace_id + idempotency_key), so EVERY
+-- UPDATE on idempotency_keys threw `no such column: id` and no key could
+-- ever leave `processing` (markKey could never succeed; accepted sends
+-- were recorded in messages but never counted, audited, or marked).
+-- lib/service-send.ts markKey() already sets updated_at explicitly, so
+-- no trigger is needed here. Do NOT re-add an updated_at trigger for
+-- this table unless its WHERE clause uses the composite PK.
 CREATE TRIGGER IF NOT EXISTS user_controls_updated_at AFTER UPDATE ON platform_user_controls FOR EACH ROW BEGIN UPDATE platform_user_controls SET updated_at = datetime('now') WHERE user_id = NEW.user_id; END;
 
 -- New workspace gets a free subscription (replaces the previous database trigger).
@@ -484,6 +492,7 @@ CREATE TABLE IF NOT EXISTS bulk_campaigns (
   subject TEXT NOT NULL DEFAULT '',
   text_body TEXT NOT NULL DEFAULT '',
   html_body TEXT NOT NULL DEFAULT '',
+  provider TEXT NOT NULL DEFAULT 'auto',
   status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','sending','paused_caps','stopped','completed','failed')),
   total_recipients INTEGER NOT NULL DEFAULT 0,
   sent_count INTEGER NOT NULL DEFAULT 0,
@@ -491,6 +500,8 @@ CREATE TABLE IF NOT EXISTS bulk_campaigns (
   skipped_count INTEGER NOT NULL DEFAULT 0,
   unknown_count INTEGER NOT NULL DEFAULT 0,
   pause_reason TEXT,
+  tick_owner TEXT,
+  tick_until TEXT,
   started_at TEXT,
   finished_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -513,6 +524,7 @@ CREATE TABLE IF NOT EXISTS bulk_recipients (
   idempotency_key TEXT NOT NULL,
   error TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
+  claimed_at TEXT,
   sent_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -539,3 +551,30 @@ ALTER TABLE messages ADD COLUMN is_important INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS messages_starred_idx ON messages(mailbox_id, is_starred, received_at DESC);
 -- Spam-folder counts: the unread-counts query groups by folder.
 CREATE INDEX IF NOT EXISTS messages_folder_read_idx ON messages(mailbox_id, folder, is_read);
+
+-- ==========================================================================
+-- Bulk concurrency-guard migration (2026-11-22) — ADDITIVE ONLY.
+-- Fixes B-d: no concurrency guard on advanceCampaign (POST /start + 2s
+-- GET poll raced on deterministic idempotency keys) and blind
+-- setRecipient UPDATEs that clobbered terminal states.
+--   - bulk_recipients.claimed_at: per-recipient claim (ISO timestamp of
+--     the tick that owns the row). A claim older than 10 minutes with
+--     status still 'pending' may be re-claimed by a later tick (stale-
+--     claim recovery). NEVER auto-expire a 'processing'/'unknown'
+--     idempotency key to 'failed' on age, and never auto-retry one.
+--   - bulk_campaigns.tick_owner / tick_until: campaign-level tick lease
+--     (belt-and-braces on top of the per-recipient claim). A tick
+--     proceeds only if it wins the lease; it clears the lease at tick
+--     end. The lease is NOT a status: counts still derive only from
+--     bulk_recipients rows (getBulkCampaignSummary GROUP BY).
+--   - bulk_campaigns.provider: per-campaign provider choice ('auto' =
+--     fallback chain, or one of sendpulse/brevo/mailjet/resend = ONLY
+--     that provider, no silent fallback — enforced in the send engine).
+-- Re-running an ALTER TABLE line against a database that already has
+-- the column fails with "duplicate column name" — expected and
+-- harmless. Applied to live D1 2026-11-22.
+-- ==========================================================================
+ALTER TABLE bulk_recipients ADD COLUMN claimed_at TEXT;
+ALTER TABLE bulk_campaigns ADD COLUMN tick_owner TEXT;
+ALTER TABLE bulk_campaigns ADD COLUMN tick_until TEXT;
+ALTER TABLE bulk_campaigns ADD COLUMN provider TEXT NOT NULL DEFAULT 'auto';
