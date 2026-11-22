@@ -83,3 +83,45 @@ export async function listWorkspaceIds(userId: string): Promise<string[]> {
   const rows = await dbQuery('SELECT workspace_id FROM memberships WHERE user_id = ?', [userId]);
   return rows.map((r) => String(r.workspace_id));
 }
+
+// --- CSRF: Origin/Referer validation for mutating session routes (G-05, D8) ---
+// Browsers always send an Origin header on POST (fetch and form posts
+// alike), so a session-authenticated mutating route can trust it:
+// the request is allowed only when the Origin — or, when Origin is
+// absent, the Referer — matches this app's own origin. A request with
+// NEITHER header is rejected: it cannot come from our own pages, and
+// a cross-site form POST cannot suppress the Origin header. This is
+// the deliberate scope call in D8 (per-request CSRF tokens are
+// deferred): it closes the cross-site POST hole without touching
+// every client fetch. API-key routes (v1) and machine-token routes
+// (delivery webhook, ops) do NOT use this — they authenticate by
+// bearer token, not by cookie, so a cross-site POST cannot carry
+// their credentials in the first place.
+export function isValidOrigin(req: Request): boolean {
+  const allowed = new Set<string>();
+  try {
+    allowed.add(new URL(req.url).origin);
+  } catch {
+    // Unparseable request URL: fail closed below.
+  }
+  const appUrl = process.env.NEXT_PUBLIC_APP_URL || '';
+  if (appUrl) {
+    try {
+      allowed.add(new URL(appUrl).origin);
+    } catch {
+      // Misconfigured env: ignore it, the request origin still applies.
+    }
+  }
+  if (allowed.size === 0) return false;
+  const origin = req.headers.get('origin');
+  if (origin) return allowed.has(origin);
+  const referer = req.headers.get('referer');
+  if (referer) {
+    try {
+      return allowed.has(new URL(referer).origin);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
