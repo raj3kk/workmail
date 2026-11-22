@@ -48,6 +48,12 @@ export async function GET(req: Request) {
     where += ' AND folder = ?';
     params.push(folder);
   }
+  if (folder === 'sent') {
+    // Defence in depth (B-b): a draft must be unlistable as sent even
+    // if it was ever mis-filed — only genuinely accepted / in-flight
+    // delivery states may appear under Sent.
+    where += " AND delivery_state IN ('accepted','sent','delivered','opened','clicked','deferred')";
+  }
   if (starredOnly) {
     where += ' AND is_starred = 1';
   }
