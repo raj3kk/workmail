@@ -52,6 +52,7 @@ import {kvGet} from '@/lib/kv';
 import {autoMirrorMessage} from '@/lib/gmail-mirror';
 import {
   sendWithFallback,
+  getHostFallbackAllowed,
   MAX_ATTACHMENT_COUNT,
   MAX_ATTACHMENT_FILE_BYTES,
   MAX_TOTAL_ATTACHMENT_BYTES,
@@ -553,7 +554,9 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
   // called and before the idempotency key is reserved, so a rejected
   // pick consumes nothing and makes NO send attempt. The workspace
   // must have a provider_secrets row for the picked provider with
-  // enabled = 1 AND sender_verified = 1. No host-env fallback for a
+  // enabled = 1 AND sender_verified = 1 OR sender_attested = 1 (G-25:
+  // attested senders stay eligible; only provider-confirmed rows are
+  // shown as "Verified by provider"). No host-env fallback for a
   // manual pick: a workspace that never connected the provider (or
   // never verified its sender) gets a clear 409, never a silent send
   // from a host key.
@@ -561,7 +564,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
     input.provider && input.provider !== 'auto' ? (input.provider as ProviderName) : null;
   if (pickedProvider) {
     const verifiedRow = await dbOne(
-      'SELECT provider FROM provider_secrets WHERE workspace_id = ? AND provider = ? AND enabled = 1 AND sender_verified = 1',
+      'SELECT provider FROM provider_secrets WHERE workspace_id = ? AND provider = ? AND enabled = 1 AND (sender_verified = 1 OR sender_attested = 1)',
       [input.workspaceId, pickedProvider],
     );
     if (!verifiedRow)
@@ -712,7 +715,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
   // host env fallback for providers the workspace has not connected at all.
   // Rows whose sender is not verified are not eligible to send.
   const configs = await dbQuery(
-    'SELECT provider, secret_ciphertext, priority, sender_verified FROM provider_secrets WHERE workspace_id = ? AND enabled = 1 ORDER BY priority ASC',
+    'SELECT provider, secret_ciphertext, priority, sender_verified, sender_attested FROM provider_secrets WHERE workspace_id = ? AND enabled = 1 ORDER BY priority ASC',
     [input.workspaceId],
   );
   const configured: ConfiguredProvider[] = [];
@@ -723,6 +726,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
         provider: config.provider as ProviderName,
         secret: {api_key: secret.api_key, api_secret: secret.api_secret || ''},
         senderVerified: config.sender_verified === 1,
+        senderAttested: config.sender_attested === 1,
       });
     } catch {
       // A corrupt / undecryptable row must not kill the whole send: the
@@ -756,6 +760,10 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
   const disabledProviders = (disabledRows || [])
     .map((r) => String(r.provider))
     .filter((p): p is ProviderName => p === 'sendpulse' || p === 'brevo' || p === 'mailjet' || p === 'resend');
+  // Host env fallback gate (G-14): only workspaces with
+  // allow_host_provider_fallback = 1 may send on host env keys. The
+  // live owner workspace keeps 1; new workspaces default to 0.
+  const allowHostProviderFallback = await getHostFallbackAllowed(input.workspaceId);
   const result = await sendWithFallback(
     input.workspaceId,
     {
@@ -772,7 +780,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       headers: unsubscribeUrl ? {'List-Unsubscribe': `<${unsubscribeUrl}>`} : undefined,
     },
     configured,
-    {onlyProvider: pickedProvider ?? undefined, disabledProviders},
+    {onlyProvider: pickedProvider ?? undefined, disabledProviders, allowHostProviderFallback},
   );
 
   if (result.outcome === 'accepted') {
@@ -809,11 +817,18 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       provider_message_id: String(result.providerMessageId || ''),
       message_id: msgId,
     }).catch((e) => logBookkeepingFailure('markKey', input.workspaceId, key, msgId, e));
+    // Storage accounting (G-4): real bytes stored for this send — the
+    // rendered message bodies (UTF-8) + attachment bytes. (Migration
+    // 0004 backfilled the historical total; this keeps it current.)
+    const storedBytes =
+      Buffer.byteLength(finalText || '') +
+      Buffer.byteLength(finalHtml || '') +
+      attachments.reduce((n, a) => n + a.sizeBytes, 0);
     await dbRun(
       `INSERT INTO usage_counters (workspace_id, period_start, sent_count, received_count, storage_bytes)
-       VALUES (?, ?, 1, 0, 0)
-       ON CONFLICT(workspace_id, period_start) DO UPDATE SET sent_count = usage_counters.sent_count + 1`,
-      [input.workspaceId, period],
+       VALUES (?, ?, 1, 0, ?)
+       ON CONFLICT(workspace_id, period_start) DO UPDATE SET sent_count = usage_counters.sent_count + 1, storage_bytes = usage_counters.storage_bytes + excluded.storage_bytes`,
+      [input.workspaceId, period, storedBytes],
     ).catch((e) => logBookkeepingFailure('usage_counters', input.workspaceId, key, msgId, e));
     await dbRun(
       'INSERT INTO audit_events (id, workspace_id, actor_user_id, action, target_type, target_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
