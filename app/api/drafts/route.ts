@@ -60,7 +60,7 @@ export async function POST(req: Request) {
       ],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not save draft'}, {status: 400});
+    return NextResponse.json({error: 'Could not save draft'}, {status: 400});
   }
   return NextResponse.json({draft_id: id});
 }
@@ -75,8 +75,10 @@ export async function PATCH(req: Request) {
   if (!msg) return NextResponse.json({error: 'Draft not found'}, {status: 404});
   // Owner override, same as POST: workspace owners may edit drafts even
   // without an explicit mailbox_members row.
+  // P-02: 404 (not 403) on denial, so a cross-tenant draft-id probe
+  // cannot confirm another tenant's draft exists by the status code.
   if (!(await hasWriteAccess(user.id, String(msg.mailbox_id))))
-    return NextResponse.json({error: 'Mailbox write access denied'}, {status: 403});
+    return NextResponse.json({error: 'Draft not found'}, {status: 404});
   await dbRun(
     'UPDATE messages SET to_email = ?, subject = ?, text_body = ?, updated_at = ? WHERE id = ?',
     [String(b.to || ''), String(b.subject || '').slice(0, 998), String(b.text || '').slice(0, 100000), nowIso(), b.id],
