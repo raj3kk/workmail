@@ -20,6 +20,7 @@ type ProviderRow = {
   } | null;
   sent_month_from_delivery_logs: number;
   failed_month_from_delivery_logs: number;
+  rejected_attempts_month_from_delivery_logs: number;
   counts_source: string;
   estimate_label: string;
 };
@@ -40,6 +41,8 @@ type DashboardData = {
     failed_all_time: number;
     failed_month: number;
     received_month: number;
+    received_all_time: number;
+    failed_unattributed: number;
     definitions: {sent: string; failed: string; received: string};
   };
   workspace_usage: {sent_count: number; received_count: number; monthly_send_limit: number; period: string};
@@ -232,6 +235,7 @@ export default function DashboardPage() {
               <div style={cardStyle}>
                 <small className="muted">Received this month</small>
                 <div style={{fontSize: 28, fontWeight: 800}}>{t.received_month}</div>
+                <small className="muted">all-time: {t.received_all_time}</small>
               </div>
             </div>
           </section>
@@ -267,6 +271,7 @@ export default function DashboardPage() {
                       <th align="left">Sender</th>
                       <th align="left">Sent (month)</th>
                       <th align="left">Failed (month)</th>
+                      <th align="left">Attempts rejected (month)</th>
                       <th align="left">Free-limit remaining (estimate)</th>
                     </tr>
                   </thead>
@@ -281,6 +286,7 @@ export default function DashboardPage() {
                         <td>{p.sender_verified ? "Verified" : "Not verified"}</td>
                         <td>{p.sent_month_from_delivery_logs}</td>
                         <td>{p.failed_month_from_delivery_logs}</td>
+                        <td>{p.rejected_attempts_month_from_delivery_logs}</td>
                         <td>
                           {p.cap_state ? (
                             <>
@@ -308,8 +314,14 @@ export default function DashboardPage() {
               </div>
             )}
             <small className="muted">
-              Sent/failed per provider are from delivery logs (delivery_events, current month). Free-limit remaining is
-              an estimate from D1 accepted sends — the provider’s own counter is the authority.
+              Sent/failed per provider are from delivery logs (delivery_events, current month) and use the same
+              definition as Totals: failed means the send was never accepted by any provider, attributed to the last
+              provider attempted for that send — so the per-provider Failed figures sum to Totals Failed
+              {t.failed_unattributed > 0 &&
+                ` (plus ${t.failed_unattributed} failed send${t.failed_unattributed === 1 ? "" : "s"} with no recorded rejection, counted in Totals only)`}
+              . “Attempts rejected” counts individual provider rejections: a send rejected by one provider but
+              accepted by the next in the chain counts here, not as a failed send. Free-limit remaining is an
+              estimate from D1 accepted sends — the provider’s own counter is the authority.
             </small>
           </section>
 
@@ -359,8 +371,12 @@ export default function DashboardPage() {
                 <b>Received:</b> {t.definitions.received}
               </li>
               <li>
-                <b>Per-provider sent/failed:</b> counted from delivery_events rows (event_type ‘accepted’ vs
-                ‘rejected’) for the current month — labelled “from delivery logs”.
+                <b>Per-provider sent/failed:</b> counted from delivery_events rows for the current month. Sent =
+                ‘accepted’ events (one per send — the provider that took it). Failed = the same definition as
+                Totals Failed (sends never accepted by any provider), attributed to the last provider attempted for
+                each send, so the per-provider Failed figures sum to Totals Failed. “Attempts rejected” = individual
+                ‘rejected’ events: a send rejected by one provider but accepted by the next counts there, not as a
+                failed send.
               </li>
               <li>
                 <b>Free-limit remaining:</b> {data.estimate_label}. Caps enforced in code: SendPulse 12,000/month +
