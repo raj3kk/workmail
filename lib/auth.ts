@@ -1,4 +1,4 @@
-import {dbOne, dbQuery, dbRun, dbBatch, newId, nowIso} from '@/lib/db';
+import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
 import {newSessionToken, hashToken} from '@/lib/mfa';
 
 // Google OAuth (authorization-code flow) + D1-backed sessions.
@@ -9,7 +9,12 @@ export interface SessionUser {
   mfa_secret: string | null; suspended_at: string | null;
 }
 
-const COOKIE = 'wm_session';
+const COOKIE = '__Host-wm_session';
+// __Host- prefix (G-10): the cookie is only ever sent to this exact
+// host, never to subdomains, and the prefix itself forces Secure +
+// Path=/ with no Domain attribute (all already true here). Browsers
+// holding the old `wm_session` cookie are logged out once on their
+// next request and get the new cookie at their next login.
 
 export function getSessionToken(req: Request): string | null {
   const cookie = req.headers.get('cookie') || '';
@@ -61,26 +66,112 @@ export async function markSessionMfaVerified(sessionId: string): Promise<void> {
   await dbRun('UPDATE sessions SET mfa_verified = 1 WHERE id = ?', [sessionId]);
 }
 
+// Session revocation (G-10). Returns the number of sessions destroyed.
+// With exceptSessionId set, every OTHER session of the user is
+// destroyed (the revoke-all endpoint); without it, all of them are
+// (login rotation: the fresh session created after this call is the
+// user's only live session).
+export async function revokeAllSessions(userId: string, exceptSessionId?: string | null): Promise<number> {
+  if (exceptSessionId) {
+    const r = await dbRun('DELETE FROM sessions WHERE user_id = ? AND id != ?', [userId, exceptSessionId]);
+    return r.changes;
+  }
+  const r = await dbRun('DELETE FROM sessions WHERE user_id = ?', [userId]);
+  return r.changes;
+}
+
+// Reconcile a user's workspace scaffolding (G-18): make sure the user
+// has at least one workspace with owner membership, workspace
+// settings, and an active subscription, creating whichever pieces are
+// missing. Every step is idempotent (INSERT OR IGNORE / existence
+// checks), so it is safe to run on every login — it is the self-heal
+// for a signup that died mid-sequence, and the normal path for a
+// user whose rows were cleaned up by the compensation below.
+export async function ensureUserWorkspace(userId: string, email: string, displayName: string | null): Promise<string> {
+  const now = nowIso();
+  const existing = await dbOne(
+    'SELECT workspace_id FROM memberships WHERE user_id = ? ORDER BY created_at ASC LIMIT 1',
+    [userId],
+  );
+  let workspaceId = existing?.workspace_id ? String(existing.workspace_id) : null;
+  if (!workspaceId) {
+    workspaceId = newId();
+    await dbRun('INSERT INTO workspaces (id, name, owner_user_id, created_at) VALUES (?, ?, ?, ?)', [
+      workspaceId,
+      `${displayName || email}'s Workspace`,
+      userId,
+      now,
+    ]);
+  }
+  await dbRun('INSERT OR IGNORE INTO memberships (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', [
+    workspaceId,
+    userId,
+    'owner',
+    now,
+  ]);
+  await dbRun(
+    'INSERT OR IGNORE INTO workspace_settings (workspace_id, plan, monthly_send_limit, retention_days, created_at) VALUES (?, ?, 300, 90, ?)',
+    [workspaceId, 'free', now],
+  );
+  const sub = await dbOne(
+    "SELECT id FROM subscriptions WHERE workspace_id = ? AND status IN ('pending','active','past_due') LIMIT 1",
+    [workspaceId],
+  );
+  if (!sub) {
+    await dbRun(
+      'INSERT INTO subscriptions (id, workspace_id, plan_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [newId(), workspaceId, 'free', 'active', now, now],
+    );
+  }
+  return workspaceId;
+}
+
 // Google userinfo -> user row. First login creates the user, a personal
 // workspace, owner membership, workspace settings and a free subscription
 // (previously done by a database trigger; now explicit application code).
+//
+// G-18: the create sequence is NOT atomic (dbBatch is sequential
+// /query calls — see lib/db.ts), so a failure mid-sequence used to
+// leave partial rows (a user with no workspace, or a workspace with
+// no settings/subscription). Two defences now apply:
+//   1. Compensation: if any step throws, the rows created in THIS
+//      attempt are deleted in reverse dependency order and the error
+//      is rethrown, so the login fails cleanly instead of half-creating
+//      an account.
+//   2. Reconcile on next login: every login (new or returning user)
+//      runs ensureUserWorkspace, which rebuilds any missing piece
+//      idempotently — so even a partial row set left behind by an
+//      older failure (or a cleanup that itself failed) heals itself
+//      the next time the user signs in.
 export async function upsertGoogleUser(profile: {sub: string; email: string; name?: string | null}): Promise<SessionUser> {
   const email = profile.email.toLowerCase();
   const existing = await dbOne('SELECT id, email, display_name, mfa_secret, suspended_at FROM users WHERE google_sub = ? OR email = ?', [profile.sub, email]);
   if (existing) {
     await dbRun('UPDATE users SET google_sub = ?, display_name = ?, updated_at = ? WHERE id = ?', [profile.sub, profile.name || existing.display_name, nowIso(), existing.id]);
+    await ensureUserWorkspace(String(existing.id), String(existing.email), profile.name || existing.display_name || null);
     return {id: existing.id, email: existing.email, name: profile.name || existing.display_name || null, mfa_secret: existing.mfa_secret || null, suspended_at: existing.suspended_at || null};
   }
   const userId = newId();
   const workspaceId = newId();
   const now = nowIso();
-  await dbBatch([
-    {sql: 'INSERT INTO users (id, email, google_sub, display_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', params: [userId, email, profile.sub, profile.name || '', now, now]},
-    {sql: 'INSERT INTO workspaces (id, name, owner_user_id, created_at) VALUES (?, ?, ?, ?)', params: [workspaceId, `${profile.name || email}'s Workspace`, userId, now]},
-    {sql: 'INSERT INTO memberships (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', params: [workspaceId, userId, 'owner', now]},
-    {sql: 'INSERT INTO workspace_settings (workspace_id, plan, monthly_send_limit, retention_days, created_at) VALUES (?, ?, 300, 90, ?)', params: [workspaceId, 'free', now]},
-    {sql: 'INSERT INTO subscriptions (id, workspace_id, plan_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', params: [newId(), workspaceId, 'free', 'active', now, now]},
-  ]);
+  try {
+    await dbRun('INSERT INTO users (id, email, google_sub, display_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', [userId, email, profile.sub, profile.name || '', now, now]);
+    await dbRun('INSERT INTO workspaces (id, name, owner_user_id, created_at) VALUES (?, ?, ?, ?)', [workspaceId, `${profile.name || email}'s Workspace`, userId, now]);
+    await dbRun('INSERT INTO memberships (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)', [workspaceId, userId, 'owner', now]);
+    await dbRun('INSERT INTO workspace_settings (workspace_id, plan, monthly_send_limit, retention_days, created_at) VALUES (?, ?, 300, 90, ?)', [workspaceId, 'free', now]);
+    await dbRun('INSERT INTO subscriptions (id, workspace_id, plan_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)', [newId(), workspaceId, 'free', 'active', now, now]);
+  } catch (e) {
+    // Compensation (G-18): delete the partial rows from this attempt,
+    // reverse dependency order. Each delete is failure-isolated: even
+    // if cleanup itself fails, reconcile-on-next-login rebuilds the
+    // missing pieces when the user retries.
+    await dbRun('DELETE FROM subscriptions WHERE workspace_id = ?', [workspaceId]).catch(() => {});
+    await dbRun('DELETE FROM workspace_settings WHERE workspace_id = ?', [workspaceId]).catch(() => {});
+    await dbRun('DELETE FROM memberships WHERE workspace_id = ?', [workspaceId]).catch(() => {});
+    await dbRun('DELETE FROM workspaces WHERE id = ?', [workspaceId]).catch(() => {});
+    await dbRun('DELETE FROM users WHERE id = ?', [userId]).catch(() => {});
+    throw e;
+  }
   await maybeBootstrapAdmin(userId, email);
   return {id: userId, email, name: profile.name || null, mfa_secret: null, suspended_at: null};
 }
@@ -121,6 +212,10 @@ export async function exchangeGoogleCode(code: string): Promise<{sub: string; em
   if (!infoRes.ok) throw new Error('Google userinfo fetch failed');
   const info: any = await infoRes.json();
   if (!info.sub || !info.email) throw new Error('Google profile missing sub/email');
+  // G-11: only a Google-verified email may create or claim an account.
+  // An unverified address in the profile must never become a WorkMail
+  // identity (it could belong to someone else's inbox).
+  if (info.email_verified !== true) throw new Error('Google email is not verified');
   return {sub: info.sub, email: info.email, name: info.name || null};
 }
 
