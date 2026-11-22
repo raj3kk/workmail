@@ -73,7 +73,7 @@ export async function POST(req: Request) {
       [id, p.data.workspace_id, p.data.domain_id, p.data.address.toLowerCase(), (p.data.display_name || '').trim() || 'Flow99', user.id, now],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not create mailbox'}, {status: 400});
+    return NextResponse.json({error: 'Could not create mailbox'}, {status: 400});
   }
   // The DB trigger already grants the workspace owner + creator 'manage';
   // this covers an explicit assignee and is a no-op otherwise.
@@ -124,7 +124,7 @@ export async function PATCH(req: Request) {
       ]);
     }
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not update mailbox'}, {status: 400});
+    return NextResponse.json({error: 'Could not update mailbox'}, {status: 400});
   }
   const box = await dbOne('SELECT * FROM mailboxes WHERE id = ?', [p.data.mailbox_id]);
   if (!box) return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
