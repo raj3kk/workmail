@@ -9,8 +9,8 @@
   <title>Flow99</title>
   <rect x="0" y="0" width="512" height="512" fill="#ffffff"/>
   <text x="26" y="317" font-family="Arial, Helvetica, sans-serif" font-size="80" font-weight="bold" fill="#161616">Flow</text>
-  <!-- silver-white ribbon: accent arc over the two 9s -->
-  <path d="M 295 200 Q 375 155 455 200" fill="none" stroke="#c7ccd4" stroke-width="10" stroke-linecap="round"/>
+  <!-- silver-white ribbon: accent arc over the two 9s (v4: thicker/darker so it survives small sizes) -->
+  <path d="M 295 200 Q 375 155 455 200" fill="none" stroke="#9aa1ab" stroke-width="14" stroke-linecap="round"/>
   <!-- first 9: saffron ribbon -->
   <g fill="none" stroke="#f28c28" stroke-width="22" stroke-linecap="round">
     <circle cx="325" cy="257" r="50"/>
