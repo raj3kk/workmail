@@ -61,8 +61,11 @@ export async function PATCH(req: Request, {params}: {params: {id: string}}) {
     return NextResponse.json({error: 'Invalid folder'}, {status: 400});
   const msg = await dbOne('SELECT id, mailbox_id, workspace_id FROM messages WHERE id = ?', [params.id]);
   if (!msg) return NextResponse.json({error: 'Message not found'}, {status: 404});
+  // P-02: 404 (not 403) on denial — the GET handler above does the
+  // same, so a cross-tenant id probe cannot confirm another tenant's
+  // message exists by the status code.
   if (!(await canAccessMailbox(user.id, String(msg.mailbox_id), true)))
-    return NextResponse.json({error: 'Mailbox write access denied'}, {status: 403});
+    return NextResponse.json({error: 'Message not found'}, {status: 404});
   const sets: string[] = [];
   const values: unknown[] = [];
   if (typeof b.is_read === 'boolean') {
