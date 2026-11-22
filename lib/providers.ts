@@ -428,6 +428,9 @@ export interface SendInput {
    *  drops a file; the per-provider encoding is applied in
    *  sendViaProvider. Empty/undefined = no attachments. */
   attachments?: SendAttachment[];
+  /** Extra mail headers for this send (e.g. List-Unsubscribe). Passed
+   *  verbatim to each provider's headers field. */
+  headers?: Record<string, string>;
 }
 
 async function sendViaProvider(
@@ -465,6 +468,7 @@ async function sendViaProvider(
             to: [{email: d.to}],
             text: d.text,
             html: d.html,
+            ...(d.headers ? {headers: d.headers} : {}),
             // Binary attachments go in `attachments_binary` (filename ->
             // base64). The plain `attachments` field takes URLs only and
             // would silently drop file bytes. Omitted when empty.
@@ -495,6 +499,7 @@ async function sendViaProvider(
           subject: d.subject,
           textContent: d.text,
           htmlContent: d.html,
+          ...(d.headers ? {headers: d.headers} : {}),
           ...(d.attachments?.length ? {attachment: buildBrevoAttachments(d.attachments)} : {}),
         }),
       });
@@ -523,6 +528,7 @@ async function sendViaProvider(
               TextPart: d.text,
               HTMLPart: d.html,
               CustomID: d.idempotencyKey,
+              ...(d.headers ? {Headers: d.headers} : {}),
               ...(d.attachments?.length ? {Attachments: buildMailjetAttachments(d.attachments)} : {}),
             },
           ],
@@ -556,6 +562,7 @@ async function sendViaProvider(
         subject: d.subject,
         text: d.text,
         html: d.html,
+        ...(d.headers ? {headers: d.headers} : {}),
         ...(d.attachments?.length ? {attachments: buildResendAttachments(d.attachments)} : {}),
       }),
     });
