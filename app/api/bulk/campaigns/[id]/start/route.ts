@@ -13,7 +13,7 @@
 import {NextResponse} from 'next/server';
 import {dbOne, dbRun, nowIso} from '@/lib/db';
 import {canAccessMailbox, requireUser, workspaceRole} from '@/lib/guards';
-import {advanceCampaign, checkBulkStartRateLimit} from '@/lib/bulk';
+import {advanceCampaign, checkBulkStartRateLimit, getBulkCampaignSummary} from '@/lib/bulk';
 
 export const runtime = 'nodejs';
 
@@ -48,10 +48,38 @@ export async function POST(req: Request, {params}: {params: {id: string}}) {
       {status: 429},
     );
   const now = nowIso();
-  await dbRun(
-    `UPDATE bulk_campaigns SET status = 'sending', pause_reason = NULL, started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?`,
+  // Guarded status flip: proceeds ONLY from draft/paused_caps. A 0-change
+  // result means another request already started (or stopped) this
+  // campaign — report the live status, never assume the flip happened.
+  const flipped = await dbRun(
+    `UPDATE bulk_campaigns SET status = 'sending', pause_reason = NULL, started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ? AND status IN ('draft', 'paused_caps')`,
     [now, now, params.id],
   );
-  const summary = await advanceCampaign(params.id);
-  return NextResponse.json({campaign: summary});
+  if (flipped.changes !== 1) {
+    const current = await dbOne('SELECT status FROM bulk_campaigns WHERE id = ?', [params.id]);
+    return NextResponse.json(
+      {error: `Campaign cannot be started from status "${current?.status ?? 'unknown'}". It may already be sending.`},
+      {status: 409},
+    );
+  }
+  const before = await getBulkCampaignSummary(params.id);
+  try {
+    const summary = await advanceCampaign(params.id);
+    return NextResponse.json({campaign: summary});
+  } catch (err) {
+    // The tick failed. Return the last-known server summary + tick_error
+    // (never a guessed state). Non-2xx when the tick processed nothing;
+    // 200 when some recipients were decided before the failure, so the
+    // UI keeps the confirmed progress and polls on.
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[bulk start tick]', params.id, message);
+    const summary = await getBulkCampaignSummary(params.id);
+    const decided = (s: {sent: number; failed: number; skipped: number; unknown: number} | null) =>
+      s ? s.sent + s.failed + s.skipped + s.unknown : 0;
+    const madeProgress = !!summary && !!before && decided(summary) > decided(before);
+    return NextResponse.json(
+      {campaign: summary ?? before ?? null, tick_error: message},
+      {status: madeProgress ? 200 : 500},
+    );
+  }
 }
