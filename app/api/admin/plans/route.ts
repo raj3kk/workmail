@@ -53,7 +53,7 @@ export async function POST(req: Request) {
       [payload.id, payload.name, payload.monthly_price_minor, payload.currency, payload.monthly_send_limit, payload.storage_limit_bytes, jstr(payload.features), payload.is_active, now],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not save plan'}, {status: 400});
+    return NextResponse.json({error: 'Could not save plan'}, {status: 400});
   }
   await dbRun(
     'INSERT INTO plan_change_log (id, plan_id, changed_by, before_state, after_state, created_at) VALUES (?, ?, ?, ?, ?, ?)',
