@@ -1,6 +1,7 @@
 import {NextResponse} from 'next/server';
 import {dbOne, dbRun, newId, nowIso} from '@/lib/db';
-import {requireUser, workspaceRole} from '@/lib/guards';
+import {requireUser, workspaceRole, isValidOrigin} from '@/lib/guards';
+import {withRateLimit, RATE_LIMIT_DEFAULTS} from '@/lib/rate-limit';
 
 async function txt(name: string): Promise<string[]> {
   const r = await fetch('https://dns.google/resolve?name=' + encodeURIComponent(name) + '&type=TXT', {cache: 'no-store'});
@@ -12,9 +13,18 @@ async function txt(name: string): Promise<string[]> {
 }
 
 export async function POST(req: Request) {
+  if (!isValidOrigin(req))
+    return NextResponse.json({error: 'Invalid origin'}, {status: 403});
   const {user, response} = await requireUser(req);
   if (response) return response;
   if (!user) return NextResponse.json({error: 'Unauthorized'}, {status: 401});
+  const limited = await withRateLimit({
+    scope: 'write',
+    subject: user.id,
+    limit: RATE_LIMIT_DEFAULTS.write.limit,
+    windowSeconds: RATE_LIMIT_DEFAULTS.write.windowSeconds,
+  });
+  if (limited) return limited;
   const b = await req.json().catch(() => null);
   if (!b?.domain_id) return NextResponse.json({error: 'domain_id required'}, {status: 400});
   const d = await dbOne('SELECT id, workspace_id, domain FROM domains WHERE id = ?', [b.domain_id]);
@@ -54,9 +64,14 @@ export async function POST(req: Request) {
 }
 
 export async function PUT(req: Request) {
+  if (!isValidOrigin(req))
+    return NextResponse.json({error: 'Invalid origin'}, {status: 403});
   const {user, response} = await requireUser(req);
   if (response) return response;
   if (!user) return NextResponse.json({error: 'Unauthorized'}, {status: 401});
+  // DNS writes hit the Cloudflare API: tighter cap than generic writes.
+  const limited = await withRateLimit({scope: 'write', subject: user.id, limit: 10, windowSeconds: 60});
+  if (limited) return limited;
   const b = await req.json().catch(() => null);
   if (!b?.domain_id || !['TXT', 'MX', 'CNAME'].includes(b.record_type) || !b.record_name || !b.record_content)
     return NextResponse.json({error: 'Valid domain_id, record_type, record_name and record_content required'}, {status: 400});
@@ -68,7 +83,10 @@ export async function PUT(req: Request) {
   const role = await workspaceRole(user.id, d.workspace_id);
   if (!role || !['owner', 'admin'].includes(role))
     return NextResponse.json({error: 'Workspace admin required'}, {status: 403});
-  const token = process.env.CLOUDFLARE_API_TOKEN;
+  // G-15: prefer the DNS-scoped token (Zone DNS Write, flow99.in zone
+  // only); fall back to the broad host token until the scoped token's
+  // env var is set. See docs/SECURITY.md.
+  const token = process.env.CLOUDFLARE_DNS_TOKEN || process.env.CLOUDFLARE_API_TOKEN;
   const zone = process.env.CLOUDFLARE_ZONE_ID;
   if (!token || !zone)
     return NextResponse.json({error: 'Configure Cloudflare DNS credentials server-side'}, {status: 503});
@@ -94,10 +112,27 @@ export async function PUT(req: Request) {
   });
   const j = await r.json().catch(() => null);
   if (!r.ok || !j?.success)
-    return NextResponse.json({error: 'Cloudflare rejected DNS change', details: j?.errors || []}, {status: 400});
+    return NextResponse.json(
+      {
+        error: 'Cloudflare rejected DNS change',
+        details: ((j?.errors || []) as any[]).map((e) => String(e?.message || 'DNS change failed')).slice(0, 5),
+      },
+      {status: 400},
+    );
   await dbRun(
     'INSERT INTO dns_change_log (id, workspace_id, domain_id, provider, action, record_name, record_type, record_content, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     [newId(), d.workspace_id, d.id, 'cloudflare', 'create', name, b.record_type, content, user.id, nowIso()],
   );
-  return NextResponse.json({success: true, record: j.result});
+  // G-07: return ONLY the record's own id/type/name. The raw Cloudflare
+  // record carries zone_id / zone_name and the full record body — none
+  // of that leaves the server.
+  const result = j.result || {};
+  return NextResponse.json({
+    success: true,
+    record: {
+      id: String(result.id || ''),
+      type: String(result.type || b.record_type),
+      name: String(result.name || name),
+    },
+  });
 }
