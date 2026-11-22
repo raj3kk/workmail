@@ -33,12 +33,18 @@ export async function GET(req: Request, {params}: {params: {id: string}}) {
   const campaign = loaded.campaign!;
 
   // Tick-on-poll: a `sending` campaign advances one batch per status
-  // poll. See lib/bulk.ts header for the model.
+  // poll. See lib/bulk.ts header for the model. A tick failure is
+  // logged server-side and reported as `tick_error` — never swallowed:
+  // the response still carries the last-known server summary, and the
+  // UI must show the status as unknown rather than assume progress.
+  let tickError: string | null = null;
   if (campaign.status === 'sending') {
-    await advanceCampaign(params.id).catch(() => {
-      // A tick failure must not break the status read; the next poll
-      // retries. The campaign row still says `sending`.
-    });
+    try {
+      await advanceCampaign(params.id);
+    } catch (err) {
+      tickError = err instanceof Error ? err.message : String(err);
+      console.error('[bulk tick]', params.id, tickError);
+    }
   }
   const summary = await getBulkCampaignSummary(params.id);
   if (!summary) return NextResponse.json({error: 'Campaign not found.'}, {status: 404});
@@ -56,5 +62,5 @@ export async function GET(req: Request, {params}: {params: {id: string}}) {
      FROM bulk_recipients WHERE ${where} ORDER BY created_at ASC LIMIT ? OFFSET ?`,
     [...args, limit, offset],
   );
-  return NextResponse.json({campaign: summary, recipients});
+  return NextResponse.json({campaign: summary, recipients, tick_error: tickError});
 }
