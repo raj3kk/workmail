@@ -10,10 +10,27 @@ import {useCallback, useEffect, useRef, useState} from "react";
 // RULE 0: the <img> renders only when a photo was actually returned by the
 // API. A missing photo (404) renders the initial-letter circle, never a
 // broken image.
+//
+// Removal uses an INLINE two-step confirmation (click once to arm, click
+// again to delete) — never window.confirm(). A native confirm() dialog is
+// auto-dismissed in headless/automated browsers and returns false, which
+// made the old "Remove photo" button silently do nothing: no fetch, no
+// state change, no error. The inline arm/disarm state is plain React, so
+// it works in every browser and is clickable by automation.
+//
+// KV is eventually consistent: a GET right after an upload can still 404
+// for a moment, so loadPhoto retries a 404 twice (400ms, then 1200ms)
+// before settling on the letter fallback. Without the retry the section
+// could show "no photo" right after a successful save.
 
 const MAX_BYTES = 2 * 1024 * 1024;
 const ACCEPTED = ["image/jpeg", "image/png", "image/webp"];
 const ACCEPT_ATTR = "image/jpeg,image/png,image/webp";
+const CONFIRM_ARM_MS = 5000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function formatSize(bytes: number): string {
   if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + " MB";
@@ -35,32 +52,59 @@ export default function ProfilePhotoSection({
   const [notice, setNotice] = useState("");
   const [saving, setSaving] = useState(false);
   const [removing, setRemoving] = useState(false);
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const previewRef = useRef<string | null>(null);
+  const armTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function disarmRemove() {
+    if (armTimerRef.current) {
+      clearTimeout(armTimerRef.current);
+      armTimerRef.current = null;
+    }
+    setConfirmingRemove(false);
+  }
+
+  function armRemove() {
+    setError("");
+    setNotice("");
+    setConfirmingRemove(true);
+    if (armTimerRef.current) clearTimeout(armTimerRef.current);
+    armTimerRef.current = setTimeout(() => setConfirmingRemove(false), CONFIRM_ARM_MS);
+  }
 
   const loadPhoto = useCallback(async () => {
     setChecking(true);
     setError("");
     try {
-      const r = await fetch(`/api/profile-photo?mailbox_id=${encodeURIComponent(mailboxId)}`);
-      if (r.status === 404) {
-        setPhotoUrl(null);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const r = await fetch(`/api/profile-photo?mailbox_id=${encodeURIComponent(mailboxId)}`);
+        if (r.status === 404) {
+          if (attempt < 2) {
+            // KV read-after-write lag: the photo may exist but not be
+            // visible yet. Retry before concluding there is no photo.
+            await sleep(attempt === 0 ? 400 : 1200);
+            continue;
+          }
+          setPhotoUrl(null);
+          return;
+        }
+        if (!r.ok) {
+          setError("Could not load the current photo.");
+          return;
+        }
+        const blob = await r.blob();
+        if (!blob.type.startsWith("image/")) {
+          setPhotoUrl(null);
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        setPhotoUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return url;
+        });
         return;
       }
-      if (!r.ok) {
-        setError("Could not load the current photo.");
-        return;
-      }
-      const blob = await r.blob();
-      if (!blob.type.startsWith("image/")) {
-        setPhotoUrl(null);
-        return;
-      }
-      const url = URL.createObjectURL(blob);
-      setPhotoUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return url;
-      });
     } catch {
       setError("Could not load the current photo.");
     } finally {
@@ -72,6 +116,7 @@ export default function ProfilePhotoSection({
     loadPhoto();
     return () => {
       if (previewRef.current) URL.revokeObjectURL(previewRef.current);
+      if (armTimerRef.current) clearTimeout(armTimerRef.current);
     };
   }, [loadPhoto]);
 
@@ -135,7 +180,7 @@ export default function ProfilePhotoSection({
   }
 
   async function removePhoto() {
-    if (!confirm(`Remove the profile photo for ${mailboxAddress}?`)) return;
+    disarmRemove();
     setRemoving(true);
     setError("");
     setNotice("");
@@ -220,10 +265,30 @@ export default function ProfilePhotoSection({
           <button type="button" disabled={!selected || saving} onClick={savePhoto}>
             {saving ? "Saving…" : "Save photo"}
           </button>
-          {photoUrl && !previewUrl && (
-            <button type="button" disabled={removing} onClick={removePhoto}>
-              {removing ? "Removing…" : "Remove photo"}
+          {photoUrl && !previewUrl && !confirmingRemove && (
+            <button type="button" disabled={removing} onClick={armRemove}>
+              Remove photo
             </button>
+          )}
+          {photoUrl && !previewUrl && confirmingRemove && (
+            <>
+              <button
+                type="button"
+                disabled={removing}
+                onClick={removePhoto}
+                style={{background: "#5b2333", borderColor: "#8a3a44"}}
+              >
+                {removing ? "Removing…" : "Click again to confirm removal"}
+              </button>
+              <button
+                type="button"
+                disabled={removing}
+                onClick={disarmRemove}
+                style={{background: "none", border: 0, color: "#bdcce0", fontSize: 12}}
+              >
+                Cancel
+              </button>
+            </>
           )}
           {previewUrl && (
             <button
