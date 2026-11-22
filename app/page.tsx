@@ -32,9 +32,9 @@ function isAcceptedRow(m:any):boolean{const s=String(m?.delivery_state||"").toLo
 // plain-words reason instead of a bare login screen. Never a bare
 // redirect again.
 const AUTH_ERROR_MESSAGES: Record<string, string> = {
-  access_denied: "Google did not approve the sign-in — you may have cancelled, or Google showed a warning about this app. If you saw an 'unverified app' warning, the app's Google verification is still pending; try again, or contact the WorkMail owner.",
+  access_denied: "Google did not approve the sign-in — you may have cancelled, backed out of a warning, or the phone challenge timed out. If you were doing the phone challenge (tap Yes, then pick a number), stay on the Google tab — the number to match is shown there, and the attempt ends if the tab closes or times out. If you saw an 'unverified app' warning, the app's Google verification is still pending; try again, or contact the WorkMail owner.",
   google_error: "Google returned an error during sign-in. Try again — if it keeps happening, contact the WorkMail owner.",
-  no_code: "Google sent us back without a sign-in code. Try again.",
+  no_code: "Google sent us back without a sign-in code — the sign-in may have timed out (for example, during the phone challenge). Try again, and stay on the Google tab until it finishes.",
   state_mismatch: "Your sign-in session expired or the browser blocked the sign-in cookie. Try again — if it keeps failing, allow cookies for this site or try another browser.",
   rate_limited: "Too many sign-in attempts. Wait a minute and try again.",
   token_failed: "Google could not complete the sign-in (token exchange failed). Try again — if it keeps happening, contact the WorkMail owner.",
