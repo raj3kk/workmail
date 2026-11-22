@@ -56,7 +56,7 @@ export async function POST(req: Request) {
       [invoiceId, b.workspace_id, subId, plan.monthly_price_minor, plan.currency, 'pending', now, jstr({})],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not create invoice'}, {status: 500});
+    return NextResponse.json({error: 'Could not create invoice'}, {status: 500});
   }
   const sub = await dbOne('SELECT * FROM subscriptions WHERE id = ?', [subId]);
   const invoice = await dbOne('SELECT * FROM invoices WHERE id = ?', [invoiceId]);
