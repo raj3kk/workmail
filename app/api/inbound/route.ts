@@ -5,6 +5,7 @@ import {dbOne, dbRun, newId, nowIso} from '@/lib/db';
 import {kvPut, kvDelete} from '@/lib/kv';
 import {maybeAutoReply} from '@/lib/ai';
 import {applyMailRules} from '@/lib/filters';
+import {autoMirrorMessage} from '@/lib/gmail-mirror';
 
 export const runtime = 'nodejs';
 
@@ -211,6 +212,9 @@ export async function POST(req: Request) {
      ON CONFLICT(workspace_id, period_start) DO UPDATE SET received_count = usage_counters.received_count + 1, storage_bytes = usage_counters.storage_bytes + excluded.storage_bytes`,
     [box.workspace_id, period, storedBytes],
   );
+  // Phase 4 Gmail backup mirror — auto-mirror hook (best-effort, never
+  // throws, never changes the 202 acceptance of the inbound message).
+  await autoMirrorMessage(String(box.workspace_id), messageId);
   // AI auto-reply hook (additive, best-effort). When the per-mailbox
   // auto-reply toggle is ON and the AI agent is configured, the reply is
   // TRANSMITTED automatically via the service send path (see lib/ai.ts
