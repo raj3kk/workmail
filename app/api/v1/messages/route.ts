@@ -17,7 +17,9 @@ export const runtime = 'nodejs';
 //   - Bodies (text_body/html_body) are included ONLY with
 //     ?include_body=true, and only for the key's own workspace.
 // Rows: id, mailbox_id, folder, from, to, subject, delivery_state,
-// provider, received_at, created_at (+ bodies when requested).
+// provider, thread_id, message_id, received_at, created_at (+ bodies
+// when requested). thread_id / message_id are what an AI agent passes
+// back as thread_id / in_reply_to when replying in-thread (E1).
 
 const DELIVERY_STATES = [
   'received',
@@ -106,7 +108,7 @@ export async function GET(req: Request) {
   const total = Number(totalRows[0]?.c || 0);
   const bodyCols = includeBody ? ', text_body, html_body' : '';
   const rows = await dbQuery(
-    `SELECT id, mailbox_id, folder, from_email, to_email, subject, delivery_state, provider, received_at, created_at${bodyCols}
+    `SELECT id, mailbox_id, folder, from_email, to_email, subject, delivery_state, provider, thread_id, message_id, received_at, created_at${bodyCols}
      FROM messages ${where} ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?`,
     [...params, limit, offset],
   );
@@ -120,6 +122,12 @@ export async function GET(req: Request) {
       subject: String(r.subject || ''),
       delivery_state: String(r.delivery_state),
       provider: r.provider ? String(r.provider) : null,
+      // Threading fields (E1): an AI agent replies in-thread with
+      // these — thread_id groups the conversation, message_id is the
+      // Message-ID to pass as in_reply_to. Both are null when the
+      // message has no thread / no Message-ID recorded.
+      thread_id: r.thread_id ? String(r.thread_id) : null,
+      message_id: r.message_id ? String(r.message_id) : null,
       received_at: r.received_at ? String(r.received_at) : null,
       created_at: String(r.created_at),
     };
