@@ -34,7 +34,7 @@ export async function PATCH(req: Request) {
       [b.user_id, suspendedAt, reason, b.mfa_required !== false ? 1 : 0, user.id, now],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not update user controls'}, {status: 400});
+    return NextResponse.json({error: 'Could not update user controls'}, {status: 400});
   }
   // The auth guard enforces users.suspended_at, so mirror the suspension
   // there too; the old route only wrote platform_user_controls, which the
