@@ -241,10 +241,15 @@ export function logAttempt(a: AttemptLog): void {
   console.log(JSON.stringify({event: 'provider_attempt', ...a}));
 }
 
-/** Best-effort durable copy of an attempt in delivery_events. Never throws. */
+/** Best-effort durable copy of an attempt in delivery_events. Never throws.
+ * `recipient` is the To address (input.to) — the dashboard's Recent events
+ * table shows it; before this fix it was stored as '' so every row showed
+ * "—". The message row does not exist yet at attempt time, so messageId
+ * stays null here (as before). */
 async function recordAttemptEvent(
   workspaceId: string,
   messageId: string | null,
+  recipient: string,
   provider: ProviderName,
   idempotencyKey: string,
   result: AttemptResult,
@@ -270,7 +275,7 @@ async function recordAttemptEvent(
         provider,
         `attempt:${idempotencyKey}:${provider}`,
         eventType,
-        '',
+        recipient,
         jstr({result, latency_ms: latencyMs, cap, reason: reason || null, idempotency_key: idempotencyKey}),
         nowIso(),
         nowIso(),
@@ -750,7 +755,7 @@ export async function sendWithFallback(
         http_status: null,
         reason: attempt.reason,
       });
-      await recordAttemptEvent(workspaceId, null, provider, input.idempotencyKey, 'unconfigured', 0, null, attempt.reason);
+      await recordAttemptEvent(workspaceId, null, input.to, provider, input.idempotencyKey, 'unconfigured', 0, null, attempt.reason);
       continue;
     }
 
@@ -805,7 +810,7 @@ export async function sendWithFallback(
         http_status: null,
         reason,
       });
-      await recordAttemptEvent(workspaceId, null, provider, input.idempotencyKey, 'cap_exhausted', 0, cap, reason);
+      await recordAttemptEvent(workspaceId, null, input.to, provider, input.idempotencyKey, 'cap_exhausted', 0, cap, reason);
       continue;
     }
 
@@ -830,7 +835,7 @@ export async function sendWithFallback(
         cap,
         http_status: result.httpStatus,
       });
-      await recordAttemptEvent(workspaceId, null, provider, input.idempotencyKey, 'accepted', latency, cap);
+      await recordAttemptEvent(workspaceId, null, input.to, provider, input.idempotencyKey, 'accepted', latency, cap);
       return {outcome: 'accepted', provider, providerMessageId: result.providerMessageId, attempts};
     } catch (e) {
       const latency = Date.now() - started;
@@ -860,7 +865,7 @@ export async function sendWithFallback(
           http_status: null,
           reason,
         });
-        await recordAttemptEvent(workspaceId, null, provider, input.idempotencyKey, 'unknown', latency, cap, reason);
+        await recordAttemptEvent(workspaceId, null, input.to, provider, input.idempotencyKey, 'unknown', latency, cap, reason);
         return {outcome: 'unknown', provider, attempts};
       }
       const httpStatus =
@@ -886,7 +891,7 @@ export async function sendWithFallback(
         http_status: httpStatus,
         reason,
       });
-      await recordAttemptEvent(workspaceId, null, provider, input.idempotencyKey, 'rejected', latency, cap, reason);
+      await recordAttemptEvent(workspaceId, null, input.to, provider, input.idempotencyKey, 'rejected', latency, cap, reason);
       // Definite rejection (provider answered): fall through to next provider.
     }
   }
