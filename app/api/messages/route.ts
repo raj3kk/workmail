@@ -112,7 +112,7 @@ export async function GET(req: Request) {
   const listSql = (withImportant: boolean) =>
     `SELECT id, workspace_id, mailbox_id, folder, from_email, to_email, subject, text_body, is_read, is_starred, ${
       withImportant ? 'is_important, ' : ''
-    }thread_id, delivery_state, received_at, created_at FROM messages ${where} ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?`;
+    }thread_id, delivery_state, provider, received_at, created_at FROM messages ${where} ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?`;
   try {
     messages = await dbQuery(listSql(true), [...params, limit, offset]);
   } catch (e) {
