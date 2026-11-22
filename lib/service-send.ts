@@ -49,6 +49,7 @@ import {createHash, randomUUID, timingSafeEqual} from 'node:crypto';
 import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
 import {decryptSecret} from '@/lib/crypto';
 import {kvGet} from '@/lib/kv';
+import {autoMirrorMessage} from '@/lib/gmail-mirror';
 import {
   sendWithFallback,
   MAX_ATTACHMENT_COUNT,
@@ -58,6 +59,17 @@ import {
   type ProviderName,
   type SendAttachment,
 } from '@/lib/providers';
+import {
+  buildUnsubscribeMailto,
+  deriveBrandFromDomain,
+  getTemplate,
+  htmlToText,
+  renderTemplateHtml,
+  renderTemplateText,
+  unsubscribeFooterHtml,
+  unsubscribeFooterText,
+  UnknownTemplateVariableError,
+} from '@/lib/templates';
 
 export const SERVICE_AUTH_HEADER = 'authorization';
 export const SERVICE_TOKEN_ENV_VAR = 'OPS_CRON_TOKEN';
@@ -267,6 +279,21 @@ export interface ExecuteSendInput {
    *  and included in the request hash, so reusing a key with different
    *  attachments is a 409. */
   attachments?: SendAttachmentRef[];
+  /** Template to render server-side (lib/templates.ts). The stored
+   *  template is the content: subject + html/text are rendered from it
+   *  and the caller's `text`/`html` (if any) are ignored. Unknown
+   *  template variables reject the send with 400 — never silently
+   *  dropped. */
+  templateId?: string;
+  /** Values for the template's variables (name, otp, action_url, ...).
+   *  `sender_name` and `unsubscribe_url` are always supplied by the
+   *  server and cannot be overridden by the caller. */
+  variables?: Record<string, string>;
+  /** Unsubscribe address for this send (a mailto: link). Supplied by
+   *  bulk sends and template sends; when present, the List-Unsubscribe
+   *  header is set and the footer link is appended unless the rendered
+   *  HTML already carries it. */
+  unsubscribeUrl?: string;
 }
 
 export interface SendActor {
@@ -287,6 +314,56 @@ export interface SendExecution {
   providerMessageId: string | null;
   /** D1 messages row id of the accepted send, or null. */
   messageId: string | null;
+  /** Final rendered text/html (after template render + footer). The
+   *  route stores these in the outbound_jobs payload so a retry
+   *  re-sends the rendered content, not the unrendered template. */
+  rendered?: {subject?: string; text?: string; html?: string};
+}
+
+/** Workspace names that are not a real brand (setup defaults, generic
+ *  words). A workspace with one of these names falls through to the
+ *  domain brand part instead of sending as e.g. "My Workspace". */
+const GENERIC_WORKSPACE_NAMES = new Set([
+  'workmail',
+  'my workspace',
+  'workspace',
+  'default',
+  'untitled',
+  'new workspace',
+  'personal',
+  'test',
+  'demo',
+  'my business',
+  'business',
+  'my company',
+  'company',
+]);
+
+/**
+ * From-name fallback (D3). Mailbox display_name first; then the
+ * workspace name when it looks like a real brand; then the domain
+ * brand part (flow99.in -> Flow99). There is NO hard-coded brand
+ * literal here and "WorkMail" is never used as a sender name.
+ */
+export async function resolveFromName(workspaceId: string, sender: ResolvedSender): Promise<string> {
+  if (sender.display_name && sender.display_name.trim()) return sender.display_name.trim();
+  const ws = await dbOne('SELECT name FROM workspaces WHERE id = ?', [workspaceId]);
+  const rawName = ws ? String(ws.name || '').trim() : '';
+  if (rawName && rawName.length >= 2 && rawName.length <= 80 && !GENERIC_WORKSPACE_NAMES.has(rawName.toLowerCase())) {
+    // A workspace named e.g. "Flipify's Workspace" is the Flipify
+    // brand with a generic suffix — strip the suffix before using it.
+    const stripped = rawName
+      .replace(/'s workspace$/i, '')
+      .replace(/ workspace$/i, '')
+      .trim();
+    const candidate = stripped.length >= 2 ? stripped : rawName;
+    if (candidate.length <= 80 && !GENERIC_WORKSPACE_NAMES.has(candidate.toLowerCase())) return candidate;
+  }
+  const wsName = rawName;
+  const dom = await dbOne('SELECT domain FROM domains WHERE id = ?', [sender.domain_id]);
+  const brand = deriveBrandFromDomain(dom ? String(dom.domain || '') : '');
+  if (brand) return brand;
+  return wsName || 'Mail';
 }
 
 async function markKey(
@@ -410,6 +487,68 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       messageId: null,
     });
 
+  // From-name (D3) — resolved once, used by the template context, the
+  // provider From header, and the unsubscribe footer alike.
+  const fromName = await resolveFromName(input.workspaceId, sender);
+  // Unsubscribe address for this send: explicit (bulk) or the sender
+  // mailto for template sends. Plain single sends without a template
+  // carry neither header nor footer.
+  const unsubscribeUrl = input.unsubscribeUrl || (input.templateId ? buildUnsubscribeMailto(sender.address) : undefined);
+
+  // Template render (server-side only). Runs BEFORE the idempotency key
+  // is reserved, so a missing template or an unknown variable rejects
+  // with 400 and consumes nothing. The rendered subject/html/text are
+  // what is hashed, sent to providers, and stored as the message.
+  let finalSubject = input.subject;
+  let finalText = input.text;
+  let finalHtml = input.html;
+  if (input.templateId) {
+    const template = await getTemplate(input.workspaceId, input.templateId);
+    if (!template)
+      return finish({
+        status: 409,
+        body: {error: 'Template not found for this workspace.'},
+        outcome: 'rejected',
+        provider: null,
+        providerMessageId: null,
+        messageId: null,
+      });
+    const ctx: Record<string, string> = {
+      ...(input.variables || {}),
+      sender_name: fromName,
+      unsubscribe_url: unsubscribeUrl || buildUnsubscribeMailto(sender.address),
+    };
+    try {
+      finalSubject = renderTemplateText(template.subject, ctx, true);
+      finalHtml = renderTemplateHtml(template.html_body, ctx, true);
+      finalText = template.text_body
+        ? renderTemplateText(template.text_body, ctx, true)
+        : htmlToText(finalHtml);
+    } catch (e) {
+      if (e instanceof UnknownTemplateVariableError)
+        return finish({
+          status: 400,
+          body: {error: e.message, unknown_variables: e.variables},
+          outcome: 'rejected',
+          provider: null,
+          providerMessageId: null,
+          messageId: null,
+        });
+      throw e;
+    }
+  }
+  // List-Unsubscribe footer: appended when this send carries an
+  // unsubscribe address and the rendered HTML does not already link it
+  // (template footers already do). The header is passed to the provider
+  // call below; the footer is part of the stored message body.
+  if (unsubscribeUrl) {
+    if (finalHtml && !finalHtml.includes(unsubscribeUrl))
+      finalHtml = finalHtml + unsubscribeFooterHtml(fromName, unsubscribeUrl);
+    if (finalText && !finalText.includes(unsubscribeUrl))
+      finalText = finalText + unsubscribeFooterText(fromName, unsubscribeUrl);
+    else if (!finalText && finalHtml) finalText = htmlToText(finalHtml);
+  }
+
   // Manual provider pick (F1/F2): validate BEFORE any provider is
   // called and before the idempotency key is reserved, so a rejected
   // pick consumes nothing and makes NO send attempt. The workspace
@@ -460,7 +599,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
     .sort();
 
   const hash = createHash('sha256')
-    .update(JSON.stringify({to: input.to, subject: input.subject, text: input.text, html: input.html, mailbox: sender.id, attachments: attachmentHash}))
+    .update(JSON.stringify({to: input.to, subject: finalSubject, text: finalText, html: finalHtml, mailbox: sender.id, template: input.templateId || null, attachments: attachmentHash}))
     .digest('hex');
   const existing = await dbOne(
     'SELECT * FROM idempotency_keys WHERE workspace_id = ? AND idempotency_key = ?',
@@ -606,7 +745,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
   }
 
   const from = sender.address;
-  const name = sender.display_name || 'Flow99';
+  const name = fromName;
   // Providers the workspace explicitly disabled (enabled = 0): passed
   // to the engine so they are skipped entirely in auto mode (B-e) —
   // no attempt, no log, no env-fallback call.
@@ -623,11 +762,14 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       from,
       fromName: name,
       to: input.to,
-      subject: input.subject,
-      text: input.text,
-      html: input.html,
+      subject: finalSubject,
+      text: finalText,
+      html: finalHtml,
       idempotencyKey: key,
       attachments,
+      // List-Unsubscribe header (RFC 8058 mailto form) on every bulk
+      // and template send. Plain single sends carry no header.
+      headers: unsubscribeUrl ? {'List-Unsubscribe': `<${unsubscribeUrl}>`} : undefined,
     },
     configured,
     {onlyProvider: pickedProvider ?? undefined, disabledProviders},
@@ -639,7 +781,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
     await dbRun(
       `INSERT INTO messages (id, workspace_id, mailbox_id, folder, from_email, to_email, subject, text_body, html_body, provider, delivery_state, message_id, received_at, created_at, updated_at)
        VALUES (?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?)`,
-      [msgId, input.workspaceId, sender.id, from, input.to, input.subject, input.text || '', input.html || '', result.provider, key, now, now, now],
+      [msgId, input.workspaceId, sender.id, from, input.to, finalSubject, finalText || '', finalHtml || '', result.provider, key, now, now, now],
     );
     // Record the attachments on the sent message so the reader shows
     // them (GET /api/messages/[id] lists by message_id). A NEW row per
@@ -677,6 +819,9 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       'INSERT INTO audit_events (id, workspace_id, actor_user_id, action, target_type, target_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [newId(), input.workspaceId, actor.userId, 'email.accepted', 'message', msgId, now],
     ).catch((e) => logBookkeepingFailure('audit_events', input.workspaceId, key, msgId, e));
+    // Phase 4 Gmail backup mirror — auto-mirror hook (best-effort, never
+    // throws, never blocks the accepted send; OFF by default per workspace).
+    await autoMirrorMessage(input.workspaceId, msgId);
     return finish({
       status: 200,
       body: {
@@ -692,6 +837,7 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       provider: result.provider,
       providerMessageId: result.providerMessageId,
       messageId: msgId,
+      rendered: {subject: finalSubject, text: finalText, html: finalHtml},
     });
   }
 
@@ -778,6 +924,9 @@ export async function executeServiceSend(input: {
   /** Passed through unchanged — the service path must not drop
    *  attachments if an auto-reply ever carries them. */
   attachments?: SendAttachmentRef[];
+  /** Template to render server-side (same rule as the user path). */
+  templateId?: string;
+  variables?: Record<string, string>;
 }): Promise<SendExecution> {
   const box = await dbOne(
     'SELECT id, address, display_name, domain_id FROM mailboxes WHERE id = ? AND workspace_id = ? AND is_active = 1',
@@ -823,6 +972,8 @@ export async function executeServiceSend(input: {
       provider: 'auto',
       draftId: input.draftId,
       attachments: input.attachments,
+      templateId: input.templateId,
+      variables: input.variables,
     },
     {kind: 'service', userId: null, serviceContext: SERVICE_CONTEXT_AI_AUTO_REPLY},
   );
