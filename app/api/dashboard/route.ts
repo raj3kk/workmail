@@ -23,7 +23,7 @@
 import {NextResponse} from 'next/server';
 import {dbOne, dbQuery, jparse} from '@/lib/db';
 import {requireUser, listWorkspaceIds} from '@/lib/guards';
-import {PROVIDER_CHAIN, PROVIDER_CAPS, getCapState, type ProviderName} from '@/lib/providers';
+import {ALL_PROVIDERS, PROVIDER_CAPS, getCapState, type ProviderName} from '@/lib/providers';
 
 export const runtime = 'nodejs';
 
@@ -170,7 +170,10 @@ export async function GET(req: Request) {
     }
 
     const providers = [];
-    for (const provider of PROVIDER_CHAIN) {
+    // All providers are listed (including manual-only SendPulse) so
+    // its caps stay visible; the Auto chain order lives in
+    // lib/providers.ts and no longer includes SendPulse.
+    for (const provider of ALL_PROVIDERS) {
       const secret = secretByProvider.get(provider);
       let capState = null;
       try {
