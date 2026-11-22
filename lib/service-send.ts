@@ -20,32 +20,24 @@
 //     AI auto-replies rarely carry attachments, but the service path
 //     must not drop them if present.
 //
-// Service authentication (HTTP boundary only):
-//   - Header: `Authorization: Bearer <token>` — the token is NEVER read
-//     from query strings, bodies, or cookies.
-//   - Token env var name: OPS_CRON_TOKEN (already set as a host var; the
-//     value is never logged, never returned, never committed).
-//   - Comparison is timing-safe (SHA-256 both sides, timingSafeEqual),
-//     the same pattern as /api/ops/reconcile. A missing/empty expected
-//     token never matches.
-//   - The service token is accepted ONLY for AI auto-reply sends
-//     (service_context 'ai-auto-reply', enforced in the route). It is
-//     not a general-purpose send credential.
+// Service authentication: the old HTTP service branch of /api/send
+// (Bearer OPS_CRON_TOKEN, service_context 'ai-auto-reply') was deleted
+// in Phase 3a (G-02) — no live HTTP caller existed. OPS_CRON_TOKEN still
+// authenticates the ops routes (/api/ops/monitor, /api/ops/reconcile);
+// it is never a send credential anymore.
 //
-// Trust boundary for in-process callers: `executeServiceSend` is also
-// called directly (same process, no HTTP hop) by lib/ai.ts
-// `maybeAutoReply`, which itself is only reachable from the inbound
-// webhook — an entry point already authenticated by its own token
-// (INBOUND_WEBHOOK_TOKEN). There is no bearer token to present on an
-// in-process call; the OPS_CRON_TOKEN check lives at the HTTP boundary
-// (the /api/send service branch, via `validateServiceToken`), and the
+// Trust boundary for in-process callers: `executeServiceSend` is called
+// directly (same process, no HTTP hop) by lib/ai.ts `maybeAutoReply`,
+// which itself is only reachable from the inbound webhook — an entry
+// point already authenticated by its own token (INBOUND_WEBHOOK_TOKEN).
+// There is no bearer token to present on an in-process call; the
 // in-process caller is inside the same trust domain as that boundary.
 //
 // Logging: service sends emit one structured JSON line
 // (event 'service_send') carrying metadata only — workspace, mailbox,
 // outcome, provider, message id, idempotency key. Never message bodies,
 // never secrets, never the token.
-import {createHash, randomUUID, timingSafeEqual} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
 import {decryptSecret} from '@/lib/crypto';
 import {kvGet} from '@/lib/kv';
@@ -72,32 +64,11 @@ import {
   UnknownTemplateVariableError,
 } from '@/lib/templates';
 
-export const SERVICE_AUTH_HEADER = 'authorization';
-export const SERVICE_TOKEN_ENV_VAR = 'OPS_CRON_TOKEN';
-/** The only service use the token authorises. Anything else is rejected. */
+/** The only service use: AI auto-reply sends (in-process only). The old
+ *  HTTP service branch (Bearer OPS_CRON_TOKEN) was deleted in Phase 3a
+ *  (G-02) — no live HTTP caller existed. OPS_CRON_TOKEN still
+ *  authenticates the ops routes; it is never a send credential. */
 export const SERVICE_CONTEXT_AI_AUTO_REPLY = 'ai-auto-reply';
-
-// --- Service-token validation (header only, timing-safe) -------------------
-
-function serviceTokenMatches(supplied: string): boolean {
-  const expected = process.env[SERVICE_TOKEN_ENV_VAR] || '';
-  if (!supplied || !expected) return false;
-  const a = createHash('sha256').update(supplied).digest();
-  const b = createHash('sha256').update(expected).digest();
-  return timingSafeEqual(a, b);
-}
-
-/** True when `authHeader` (`Authorization: Bearer <token>`) carries the valid service token. */
-export function validateServiceToken(authHeader: string | null): boolean {
-  if (!authHeader) return false;
-  const supplied = authHeader.replace(/^Bearer\s+/i, '');
-  return serviceTokenMatches(supplied);
-}
-
-/** True when the request bears a valid service token in the Authorization header. Never reads query strings. */
-export function isServiceAuthenticated(req: Request): boolean {
-  return validateServiceToken(req.headers.get(SERVICE_AUTH_HEADER));
-}
 
 // --- Attachment resolution --------------------------------------------------
 // Compose uploads a file first (POST /api/attachments, bytes in KV) and
@@ -538,6 +509,23 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
       throw e;
     }
   }
+  // Mailbox signature (E5-10, centralised at merge): appended server-side
+  // to EVERY outbound send from this mailbox — compose, bulk, v1 API and
+  // AI auto-reply alike — after template render and before the
+  // unsubscribe footer + idempotency hash, so the stored message and the
+  // hash both carry it. The compose page no longer appends it client-side
+  // (removed at merge) so it is never doubled. Text-only signature, same
+  // "\n\n-- \n" form as before; the HTML form is the escaped equivalent.
+  {
+    const sigRow = await dbOne('SELECT signature FROM mailboxes WHERE id = ? AND workspace_id = ?', [sender.id, input.workspaceId]);
+    const sig = sigRow?.signature ? String(sigRow.signature).trim() : '';
+    if (sig) {
+      const esc = sig.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      if (finalHtml) finalHtml = finalHtml + `<br><br>-- <br>${esc.replace(/\n/g, '<br>')}`;
+      if (finalText) finalText = finalText + `\n\n-- \n${sig}`;
+      else if (finalHtml) finalText = htmlToText(finalHtml);
+    }
+  }
   // List-Unsubscribe footer: appended when this send carries an
   // unsubscribe address and the rendered HTML does not already link it
   // (template footers already do). The header is passed to the provider
@@ -921,9 +909,9 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
 // --- Service entry point ----------------------------------------------------
 // Resolves the mailbox by id (must belong to the workspace and be active)
 // and runs the shared pipeline as the service actor. No user session is
-// involved. Callers over HTTP must have passed `validateServiceToken`
-// first; the in-process caller (lib/ai.ts) runs inside the server behind
-// the already-authenticated inbound webhook (see module header).
+// involved. No HTTP caller exists: the in-process caller (lib/ai.ts)
+// runs inside the server behind the already-authenticated inbound
+// webhook (see module header).
 export async function executeServiceSend(input: {
   workspaceId: string;
   mailboxId: string;
