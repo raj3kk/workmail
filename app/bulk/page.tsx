@@ -20,7 +20,7 @@ type Preview = {
 };
 type Campaign = {
   id: string; workspace_id: string; mailbox_id: string; name: string; subject: string;
-  status: string; provider?: string; total_recipients: number; sent: number; failed: number; skipped: number;
+  status: string; provider?: string; template_id?: string | null; total_recipients: number; sent: number; failed: number; skipped: number;
   unknown: number; pending: number; pause_reason: string | null; started_at: string | null;
   finished_at: string | null; created_at: string;
 };
@@ -47,6 +47,8 @@ export default function BulkPage() {
   const [subject, setSubject] = useState("Hello {{name}}");
   const [text, setText] = useState("Hi {{name}},\n\nThis is a message from {{company}}.");
   const [html, setHtml] = useState("");
+  const [templates, setTemplates] = useState<any[]>([]);
+  const [templateId, setTemplateId] = useState("");
   const [campaignName, setCampaignName] = useState("");
   const [provider, setProvider] = useState("auto");
   const [campaign, setCampaign] = useState<Campaign | null>(null);
@@ -82,6 +84,16 @@ export default function BulkPage() {
     if (r.ok) setCampaigns(d.campaigns || []);
   }
   useEffect(() => { loadCampaigns(); }, [workspaceId]);
+  // Templates (Phase 1): a picked template renders per recipient at
+  // send time; its variables must be recipient columns (checked by the
+  // server at creation). The text/HTML boxes are then unused.
+  useEffect(() => {
+    if (!workspaceId) return;
+    fetch(`/api/templates?workspace_id=${encodeURIComponent(workspaceId)}`).then((r) => r.json()).then((d) => {
+      if (d.templates) setTemplates(d.templates);
+    }).catch(() => {});
+  }, [workspaceId]);
+  const selectedTemplate = templates.find((t: any) => t.id === templateId) || null;
 
   // Status poll: the ONLY source of progress counts is the server
   // summary (d.campaign). On any poll failure the last confirmed
@@ -135,11 +147,11 @@ export default function BulkPage() {
 
   async function createCampaign() {
     if (!preview || !mailboxId) { setNotice("Upload and preview a file, then pick a sending mailbox."); return; }
-    if (!subject.trim() || (!text.trim() && !html.trim())) { setNotice("Write a subject and a message body first."); return; }
+    if (!subject.trim() || ((!text.trim() && !html.trim()) && !templateId)) { setNotice("Write a subject and a message body first, or pick a template."); return; }
     setBusy(true);
     try {
       const r = await fetch("/api/bulk/campaigns", {method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({workspace_id: workspaceId, mailbox_id: mailboxId, name: campaignName, subject, text, html, provider, recipients: preview.recipients})});
+        body: JSON.stringify({workspace_id: workspaceId, mailbox_id: mailboxId, name: campaignName, subject, text, html, provider, template_id: templateId || undefined, recipients: preview.recipients})});
       const d = await r.json();
       if (!r.ok) { setNotice(d.error || "Could not create the campaign"); return; }
       setCampaign(d.campaign);
@@ -231,6 +243,7 @@ export default function BulkPage() {
         <div className="brand"><span className="logo smallLogo">W</span><span><b>WorkMail</b><small>BULK SEND</small></span></div>
         <button className="nav" onClick={() => { location.href = "/"; }}>← Back to inbox</button>
         <button className="nav" onClick={() => { location.href = "/dashboard"; }}>▤ Dashboard</button>
+        <button className="nav" onClick={() => { location.href = "/templates"; }}>▦ Templates</button>
         <div className="navLabel">WORKSPACE</div>
         <select value={workspaceId} onChange={(e) => setWorkspaceId(e.target.value)}>
           {workspaces.map((w: any) => <option key={w.id} value={w.id}>{w.name}</option>)}
@@ -274,9 +287,23 @@ export default function BulkPage() {
             <h2>2 · Compose one message</h2>
             <p className="muted">Use {"{{name}}"} or any column name as a placeholder. Missing fields render empty — never a crash.</p>
             <label>Campaign name (optional)<input value={campaignName} onChange={(e) => setCampaignName(e.target.value)} placeholder="e.g. November launch" style={{width: "100%"}} /></label>
+            <label>Template (optional — renders per recipient at send time)
+              <select value={templateId} onChange={(e) => {
+                const id = e.target.value;
+                setTemplateId(id);
+                if (id) {
+                  const t = templates.find((x: any) => x.id === id);
+                  if (t && t.subject) setSubject(t.subject);
+                }
+              }} style={{width: "100%"}}>
+                <option value="">No template — plain message below</option>
+                {templates.map((t: any) => <option key={t.id} value={t.id}>{t.name} ({t.category}){t.is_default ? " — default" : ""}</option>)}
+              </select>
+            </label>
+            {selectedTemplate && <small className="muted">Template “{selectedTemplate.name}” will render for each recipient at send time. Its variables ({(selectedTemplate.variables || []).map((v: string) => `{{${v}}}`).join(", ") || "none"}) must come from recipient columns — the server checks this when the campaign is created. The text/HTML boxes below are not used while a template is picked.</small>}
             <label>Subject<input value={subject} onChange={(e) => setSubject(e.target.value)} style={{width: "100%"}} /></label>
-            <label>Text body<textarea value={text} onChange={(e) => setText(e.target.value)} rows={6} style={{width: "100%"}} /></label>
-            <label>HTML body (optional)<textarea value={html} onChange={(e) => setHtml(e.target.value)} rows={4} style={{width: "100%"}} placeholder="<p>Hi {{name}}, …</p>" /></label>
+            <label>Text body<textarea value={text} onChange={(e) => setText(e.target.value)} rows={6} style={{width: "100%"}} disabled={!!templateId} /></label>
+            <label>HTML body (optional)<textarea value={html} onChange={(e) => setHtml(e.target.value)} rows={4} style={{width: "100%"}} placeholder="<p>Hi {{name}}, …</p>" disabled={!!templateId} /></label>
             <label>Provider
               <select value={provider} onChange={(e) => setProvider(e.target.value)} style={{width: "100%"}}>
                 <option value="auto">Auto (fallback chain)</option>
@@ -304,7 +331,7 @@ export default function BulkPage() {
             <section>
               <h2>3 · Send &amp; progress</h2>
               {/* Counts below come ONLY from the server summary (campaign) — never computed or advanced locally. */}
-              <p><b>{campaign.name || campaign.subject}</b> · status: <b>{campaign.status}</b> · provider: <b>{!campaign.provider || campaign.provider === "auto" ? "Auto (fallback chain)" : campaign.provider}</b>{campaign.pause_reason ? ` — ${campaign.pause_reason}` : ""}</p>
+              <p><b>{campaign.name || campaign.subject}</b> · status: <b>{campaign.status}</b> · provider: <b>{!campaign.provider || campaign.provider === "auto" ? "Auto (fallback chain)" : campaign.provider}</b>{campaign.template_id ? ` · template: ${templates.find((t: any) => t.id === campaign.template_id)?.name || campaign.template_id}` : ""}{campaign.pause_reason ? ` — ${campaign.pause_reason}` : ""}</p>
               {statusUnknown && <div className="warn" style={{marginTop: 8}}>Status unknown — refreshing, not assuming progress. Counts below are the last confirmed server values.</div>}
               <p>{done} / {campaign.total_recipients} processed · sent {campaign.sent} · failed {campaign.failed} · skipped {campaign.skipped} · unknown {campaign.unknown} · pending {campaign.pending}</p>
               <div style={{height: 10, background: "#eee", borderRadius: 5, overflow: "hidden"}}>
