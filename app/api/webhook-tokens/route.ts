@@ -113,8 +113,10 @@ async function revokeToken(userId: string, id: string) {
   const row = rows[0];
   if (!row) return NextResponse.json({error: 'Webhook token not found.'}, {status: 404});
   const role = await workspaceRole(userId, String(row.workspace_id));
+  // P-02: 404 (not 403) on denial, so a cross-tenant token-id probe
+  // cannot confirm another tenant's webhook token exists by the status code.
   if (role !== 'owner' && role !== 'admin')
-    return NextResponse.json({error: 'Only workspace owners and admins can revoke webhook tokens.'}, {status: 403});
+    return NextResponse.json({error: 'Webhook token not found.'}, {status: 404});
   if (row.revoked_at) return NextResponse.json({revoked: true, already_revoked: true});
   await dbRun('UPDATE webhook_tokens SET revoked_at = ? WHERE id = ?', [nowIso(), id]);
   return NextResponse.json({revoked: true});
