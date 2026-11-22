@@ -35,7 +35,7 @@ const AUTH_ERROR_MESSAGES: Record<string, string> = {
   access_denied: "Google did not approve the sign-in — you may have cancelled, backed out of a warning, or the phone challenge timed out. If you were doing the phone challenge (tap Yes, then pick a number), stay on the Google tab — the number to match is shown there, and the attempt ends if the tab closes or times out. If you saw an 'unverified app' warning, the app's Google verification is still pending; try again, or contact the WorkMail owner.",
   google_error: "Google returned an error during sign-in. Try again — if it keeps happening, contact the WorkMail owner.",
   no_code: "Google sent us back without a sign-in code — the sign-in may have timed out (for example, during the phone challenge). Try again, and stay on the Google tab until it finishes.",
-  state_mismatch: "Your sign-in session expired or the browser blocked the sign-in cookie. Try again — if it keeps failing, allow cookies for this site or try another browser.",
+  state_mismatch: "Sign-in session match nahi hui — beech me app ya tab badal gaya, ya bahut der ho gayi. Ek hi browser tab me dobara sign-in karein, beech me app/tab mat badlein, aur 30 minute ke andar poora karein.",
   rate_limited: "Too many sign-in attempts. Wait a minute and try again.",
   token_failed: "Google could not complete the sign-in (token exchange failed). Try again — if it keeps happening, contact the WorkMail owner.",
   userinfo_failed: "Google could not share your profile. Try again.",
