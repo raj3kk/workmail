@@ -113,7 +113,7 @@ export async function POST(req: Request) {
     );
     return NextResponse.json({success: true, provider: p.data.provider, priority});
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Provider save failed'}, {status: 500});
+    return NextResponse.json({error: 'Provider save failed'}, {status: 500});
   }
 }
 
@@ -201,7 +201,7 @@ async function providerVerifyCheck(
     if (hit) return {verified: true, checked: true, reason: `SendPulse confirms sender ${String(hit.email)} is active.`};
     return {verified: false, checked: false, reason: 'SendPulse did not return a sender list this check understands — sender not confirmed; attestation only.'};
   } catch (e) {
-    return {verified: false, checked: false, reason: `Provider check could not be reached (${e instanceof Error ? e.message : 'network error'}) — sender not confirmed.`};
+    return {verified: false, checked: false, reason: 'Provider check could not be reached (network error) — sender not confirmed.'};
   }
 }
 
