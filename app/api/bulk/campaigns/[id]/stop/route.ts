@@ -21,7 +21,8 @@ export async function POST(req: Request, {params}: {params: {id: string}}) {
   const campaign = await dbOne('SELECT * FROM bulk_campaigns WHERE id = ?', [params.id]);
   if (!campaign) return NextResponse.json({error: 'Campaign not found.'}, {status: 404});
   const role = await workspaceRole(user.id, String(campaign.workspace_id));
-  if (!role) return NextResponse.json({error: 'Workspace access denied'}, {status: 403});
+  // P-02: 404 (not 403) on denial — see GET /api/bulk/campaigns/[id].
+  if (!role) return NextResponse.json({error: 'Campaign not found.'}, {status: 404});
   if (!['sending', 'paused_caps'].includes(String(campaign.status)))
     return NextResponse.json(
       {error: `Campaign cannot be stopped from status "${campaign.status}".`},
