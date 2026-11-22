@@ -902,3 +902,8 @@ CREATE TABLE IF NOT EXISTS sender_profile_steps (
   UNIQUE (workspace_id, mailbox_id, step_key)
 );
 CREATE INDEX IF NOT EXISTS idx_sender_profile_steps_mailbox ON sender_profile_steps (workspace_id, mailbox_id);
+
+-- Migration 0010 — per-provider verified sender addresses (owner order
+-- 2026-11-22: SendPulse is manual-only; it accepts mail ONLY from its
+-- verified sender addresses). ADDITIVE ONLY.
+ALTER TABLE provider_secrets ADD COLUMN verified_senders TEXT NOT NULL DEFAULT '[]';
