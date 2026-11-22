@@ -8,12 +8,14 @@ export const runtime = 'nodejs';
 // GET /api/v1/messages — integration API (Phase 2, decision D4).
 // Auth: API key ONLY (Authorization: Bearer wm_live_...), scope
 // `messages:read`. Returns ONLY the key's workspace messages.
-// Query: ?mailbox_id&limit&cursor&delivery_state&search&include_body
+// Query: ?mailbox_id&limit&cursor&delivery_state&search&label_id&include_body
 //   - limit clamped 1–100 (default 50).
 //   - cursor is an opaque base64 offset into the same ordering
 //     (received_at DESC, id DESC); response carries next_cursor or null.
 //   - delivery_state filters to one known state; search matches
 //     subject/from/to (LIKE, with % and _ escaped).
+//   - label_id (S3) filters to messages carrying that label; the label
+//     must belong to the key's workspace, else the list is empty.
 //   - Bodies (text_body/html_body) are included ONLY with
 //     ?include_body=true, and only for the key's own workspace.
 // Rows: id, mailbox_id, folder, from, to, subject, delivery_state,
@@ -70,6 +72,7 @@ export async function GET(req: Request) {
   const mailboxId = u.searchParams.get('mailbox_id');
   const deliveryState = u.searchParams.get('delivery_state');
   const search = u.searchParams.get('search');
+  const labelId = u.searchParams.get('label_id');
   const includeBody = u.searchParams.get('include_body') === 'true';
   const limitRaw = Number(u.searchParams.get('limit') || '50');
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 50;
@@ -102,6 +105,19 @@ export async function GET(req: Request) {
     where += " AND (subject LIKE ? ESCAPE '\\' OR from_email LIKE ? ESCAPE '\\' OR to_email LIKE ? ESCAPE '\\')";
     const like = `%${escapeLike(search)}%`;
     params.push(like, like, like);
+  }
+  // S3 (E5-2): filter by label, same as the inbox list. The label must
+  // belong to the key's workspace; a foreign/nonexistent id returns an
+  // empty list (no probe signal, same as a foreign mailbox_id's 403
+  // only differing in that an empty list reveals nothing at all).
+  if (labelId) {
+    const label = await dbOne('SELECT id FROM labels WHERE id = ? AND workspace_id = ?', [
+      labelId,
+      key.workspaceId,
+    ]);
+    if (!label) return NextResponse.json({messages: [], total: 0, limit, next_cursor: null});
+    where += ' AND EXISTS (SELECT 1 FROM message_labels ml WHERE ml.message_id = messages.id AND ml.label_id = ?)';
+    params.push(labelId);
   }
 
   const totalRows = await dbQuery(`SELECT COUNT(*) AS c FROM messages ${where}`, params);
