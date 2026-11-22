@@ -31,7 +31,7 @@
 // decrypted server-side only, never logged, never returned.
 import {dbQuery} from '@/lib/db';
 import {decryptSecret} from '@/lib/crypto';
-import {generateDraftText, AiNotConfiguredError} from '@/lib/ai';
+import {generateDraftText, sanitizeAiMarker, AiNotConfiguredError} from '@/lib/ai';
 
 export type AiDraftProvider = 'gemini' | 'groq';
 
@@ -172,7 +172,10 @@ function buildDraftPrompt(input: {
 /** Split a model reply into {subject, body}. Falls back to the
  *  caller's subject hint / topic when no "Subject:" line is present. */
 function parseDraftReply(text: string, fallbackSubject: string): {subject: string; body: string} {
-  const clean = (text || '').trim();
+  // The model writes [NEEDS HUMAN INPUT] where it lacks a fact; that
+  // marker leaked verbatim into a bulk AI draft on 2026-11-22. Show the
+  // human a fill-in spot instead — never the internal token.
+  const clean = sanitizeAiMarker((text || '').trim(), '[add details here]');
   const m = /^Subject:\s*(.+)$/m.exec(clean);
   if (m) {
     const subject = m[1].trim().slice(0, 200) || fallbackSubject;
