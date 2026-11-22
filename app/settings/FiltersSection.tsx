@@ -76,9 +76,9 @@ export default function FiltersSection({workspace}: {workspace: string}) {
     if (!workspace) return;
     try {
       const [fr, lr, br] = await Promise.all([
-        fetch(`/api/filters?workspace_id=${encodeURIComponent(workspace)}`),
-        fetch(`/api/labels?workspace_id=${encodeURIComponent(workspace)}`),
-        fetch("/api/mailboxes"),
+        fetch(`/api/filters?workspace_id=${encodeURIComponent(workspace)}`, {cache: "no-store"}),
+        fetch(`/api/labels?workspace_id=${encodeURIComponent(workspace)}`, {cache: "no-store"}),
+        fetch("/api/mailboxes", {cache: "no-store"}),
       ]);
       const fd = await fr.json().catch(() => null);
       if (!fr.ok) {
