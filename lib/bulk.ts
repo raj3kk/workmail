@@ -19,8 +19,8 @@
 // rest stay `pending`.
 //
 // Bulk v2 (E3 + E5-5, migration 0008): the engine above is unchanged.
-// Added: paste-a-list parsing (parsePastedRecipients), an interim
-// disposable-domain blocklist (Phase 3b G-12 centralises it), strict
+// Added: paste-a-list parsing (parsePastedRecipients), the central
+// disposable-domain blocklist (lib/email-validation.ts, G-12), strict
 // manual-message rendering (renderTemplateStrict), campaign attachments
 // (validateBulkAttachments, 2 MB/file + 1 MB total), and the
 // `personalized` flag (SAME vs per-recipient). Campaign creation
@@ -120,66 +120,14 @@ export const BULK_MAX_TOTAL_ATTACHMENT_BYTES = 1 * 1024 * 1024;
  *  exists for them). Rejected at campaign creation, same as templates. */
 export const BULK_UNSUPPLIABLE_VARIABLES = ['otp', 'action_url'] as const;
 
-/**
- * INTERIM disposable/temp-mail domain blocklist (Bulk v2, 2026-11-22).
- * Phase 3b's G-12 owns the central `lib/email-validation.ts` (~100
- * domains, applied at invite/contacts/bulk); it does not exist yet, so
- * bulk carries this top-~40 list locally and Phase 3b will centralise
- * it. Do NOT add a second shared lib file for this — the central one
- * replaces this list when it lands. The bulk page duplicates this list
- * for its live client-side parse (lib/bulk.ts is server-only: it
- * imports node:crypto/node:zlib and @/lib/db, so the client cannot
- * import it); keep the two copies in sync until G-12 lands.
- */
-export const DISPOSABLE_DOMAINS: readonly string[] = [
-  '10minutemail.com',
-  'anonymbox.com',
-  'bugmenot.com',
-  'deadaddress.com',
-  'dispostable.com',
-  'dropmail.me',
-  'emailfake.com',
-  'emailondeck.com',
-  'fakeinbox.com',
-  'filzmail.com',
-  'getnada.com',
-  'guerrillamail.com',
-  'guerrillamailblock.com',
-  'incognitomail.com',
-  'jetable.org',
-  'kasmail.com',
-  'mailcatch.com',
-  'maildrop.cc',
-  'mailinator.com',
-  'mailmetrash.com',
-  'mailnesia.com',
-  'mintemail.com',
-  'mohmal.com',
-  'mytemp.email',
-  'nobulk.com',
-  'nurfuerspam.de',
-  'pookmail.com',
-  'sharklasers.com',
-  'shitmail.me',
-  'spambox.us',
-  'spamgourmet.com',
-  'temp-mail.io',
-  'temp-mail.org',
-  'tempail.com',
-  'tempinbox.com',
-  'tempmail.com',
-  'tempmailaddress.com',
-  'tmpmail.org',
-  'trash-mail.com',
-  'trashmail.com',
-  'throwawaymail.com',
-  'yopmail.com',
-];
-
-export function isDisposableDomain(email: string): boolean {
-  const domain = email.trim().toLowerCase().split('@')[1] || '';
-  return DISPOSABLE_DOMAINS.includes(domain);
-}
+import {isDisposableDomain, DISPOSABLE_DOMAINS} from '@/lib/email-validation';
+// Central disposable/temp-mail blocklist (Phase 3b G-12): the single
+// source of truth lives in lib/email-validation.ts (~100 domains). Bulk
+// re-exports it so existing import sites (campaigns route, bulk page
+// server code) keep working with the same behaviour. The bulk page keeps
+// its own client-side mirrored copy for live parse feedback only — the
+// server is the authority. Do NOT add a second list here.
+export {DISPOSABLE_DOMAINS, isDisposableDomain} from '@/lib/email-validation';
 
 export interface PastedListResult {
   /** Valid, deduped recipients (name empty unless `Name <email>` was pasted). */
@@ -589,7 +537,7 @@ export interface BulkValidation {
   /** Data rows seen (excluding the header and fully-empty rows). */
   totalRows: number;
   valid: ParsedRecipient[];
-  invalid: Array<{row: number; email: string; reason: 'missing_email' | 'invalid_email'}>;
+  invalid: Array<{row: number; email: string; reason: 'missing_email' | 'invalid_email' | 'disposable_domain'}>;
   duplicatesRemoved: number;
   suppressed: Array<{email: string; reason: string}>;
 }
@@ -634,9 +582,10 @@ export function sheetRowsToRecipients(grid: string[][]): {
 /**
  * Validate + dedupe recipients against the workspace suppression map
  * (email -> reason, from `suppressions`). Order of checks per row:
- * missing/bad email -> duplicate (case-insensitive, keep first) ->
- * suppressed. Suppressed addresses are EXCLUDED from `valid` — they
- * never receive mail.
+ * missing/bad email -> disposable domain (G-12, rejected with a clear
+ * reason — never silently dropped) -> duplicate (case-insensitive, keep
+ * first) -> suppressed. Suppressed addresses are EXCLUDED from `valid` —
+ * they never receive mail.
  */
 export function validateRecipients(
   recipients: ParsedRecipient[],
@@ -656,6 +605,10 @@ export function validateRecipients(
     }
     if (!isValidEmail(r.email)) {
       invalid.push({row: r.row, email: r.email, reason: 'invalid_email'});
+      continue;
+    }
+    if (isDisposableDomain(r.email)) {
+      invalid.push({row: r.row, email: r.email, reason: 'disposable_domain'});
       continue;
     }
     if (seen.has(r.email)) {
@@ -890,6 +843,32 @@ async function pauseCampaign(campaignId: string, reason: string): Promise<void> 
   );
 }
 
+/**
+ * Sync the STORED campaign counters from bulk_recipients (G5b). The UI
+ * derives counts from recipients, but the stored sent_count/failed_count
+ * must agree too — they were stale live (0/2 stored vs 2 sent). The
+ * counts come only from a GROUP-BY-equivalent COUNT here, never from
+ * in-memory increments (see the module header). Best-effort: a failure
+ * is logged, never thrown — the tick already decided the recipients.
+ */
+export async function syncBulkCampaignCounters(campaignId: string): Promise<void> {
+  try {
+    await dbRun(
+      `UPDATE bulk_campaigns SET
+         sent_count = (SELECT COUNT(*) FROM bulk_recipients WHERE campaign_id = ? AND status = 'sent'),
+         failed_count = (SELECT COUNT(*) FROM bulk_recipients WHERE campaign_id = ? AND status = 'failed'),
+         updated_at = ?
+       WHERE id = ?`,
+      [campaignId, campaignId, nowIso(), campaignId],
+    );
+  } catch (e) {
+    console.warn('[bulk] syncBulkCampaignCounters failed', {
+      campaignId,
+      error: e instanceof Error ? e.message : 'unknown error',
+    });
+  }
+}
+
 async function finishCampaignIfDone(campaignId: string): Promise<void> {
   const pending = await dbOne(
     "SELECT COUNT(*) AS n FROM bulk_recipients WHERE campaign_id = ? AND status = 'pending'",
@@ -901,6 +880,9 @@ async function finishCampaignIfDone(campaignId: string): Promise<void> {
       [nowIso(), nowIso(), campaignId],
     );
   }
+  // Stored counters are synced on every tick completion, not only when
+  // the campaign finishes (paused/stopped campaigns report honestly too).
+  await syncBulkCampaignCounters(campaignId);
 }
 
 /**
@@ -936,7 +918,13 @@ export async function advanceCampaign(
     return summary;
   }
   try {
-    return await advanceCampaignClaimed(campaign, maxRecipients);
+    const summary = await advanceCampaignClaimed(campaign, maxRecipients);
+    // Tick completion: stored counters agree with the recipient rows
+    // (finishCampaignIfDone already synced, but the claimed path has
+    // early returns that skip it — sync here so every tick leaves
+    // honest stored counts behind).
+    await syncBulkCampaignCounters(campaignId);
+    return await getBulkCampaignSummary(campaignId).then((s) => s || summary);
   } finally {
     await releaseTick(campaignId, tickOwner);
   }
