@@ -36,8 +36,12 @@ That is deliberate — this is the free, VMC-free part of BIMI only.
 - SVG Tiny 1.2 profile (`version="1.2" baseProfile="tiny"`)
 - Square canvas: `viewBox="0 0 512 512"`
 - No `<script>`, no external references, no animations, standalone valid XML
-- Design: bold white "99" on a solid indigo background, with "Flow99"
-  beneath in light blue — minimal, high-contrast, readable at 32px
+- Design: the official Flow99 lockup (2026-11-22) — black "Flow" text
+  plus interlocking tricolor "99" ribbons (saffron / silver-white /
+  green), drawn as flat vector shapes (BIMI forbids raster images, so
+  the glass-ribbon render is a flat-vector rendition). White
+  background, readable at 32px. Replaces the old navy "99" mark, which
+  the owner retired as the wrong logo.
 
 ## How to check it
 
