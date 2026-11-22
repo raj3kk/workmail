@@ -1,7 +1,7 @@
 import {NextResponse} from 'next/server';
 import {z} from 'zod';
 import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
-import {requireUser, workspaceRole, listWorkspaceIds} from '@/lib/guards';
+import {requireUser, workspaceRole, listWorkspaceIds, canAccessMailbox} from '@/lib/guards';
 
 export async function GET(req: Request) {
   const {user, response} = await requireUser(req);
@@ -54,7 +54,7 @@ export async function POST(req: Request) {
   try {
     await dbRun(
       'INSERT INTO mailboxes (id, workspace_id, domain_id, address, display_name, is_active, created_by, created_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)',
-      [id, p.data.workspace_id, p.data.domain_id, p.data.address.toLowerCase(), p.data.display_name || '', user.id, now],
+      [id, p.data.workspace_id, p.data.domain_id, p.data.address.toLowerCase(), (p.data.display_name || '').trim() || 'Flow99', user.id, now],
     );
   } catch (e) {
     return NextResponse.json({error: e instanceof Error ? e.message : 'Could not create mailbox'}, {status: 400});
@@ -67,4 +67,36 @@ export async function POST(req: Request) {
   );
   const box = await dbOne('SELECT * FROM mailboxes WHERE id = ?', [id]);
   return NextResponse.json({data: box}, {status: 201});
+}
+
+export async function PATCH(req: Request) {
+  const {user, response} = await requireUser(req);
+  if (response) return response;
+  if (!user) return NextResponse.json({error: 'Unauthorized'}, {status: 401});
+  const p = z
+    .object({
+      mailbox_id: z.string().uuid(),
+      display_name: z.string().max(100),
+    })
+    .safeParse(await req.json().catch(() => null));
+  if (!p.success) return NextResponse.json({error: 'Invalid mailbox update'}, {status: 400});
+  // Write access: workspace owner, or a mailbox_members row with a
+  // permission other than 'read'. Also implies workspace membership.
+  const allowed = await canAccessMailbox(user.id, p.data.mailbox_id, true);
+  if (!allowed) return NextResponse.json({error: 'Mailbox access required'}, {status: 403});
+  // Trimmed value stored as given. Empty string means "use default" — the
+  // effective From name ('Flow99' when blank) is resolved in one place,
+  // lib/service-send.ts, never coerced here.
+  const displayName = p.data.display_name.trim();
+  try {
+    await dbRun('UPDATE mailboxes SET display_name = ? WHERE id = ?', [
+      displayName,
+      p.data.mailbox_id,
+    ]);
+  } catch (e) {
+    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not update mailbox'}, {status: 400});
+  }
+  const box = await dbOne('SELECT * FROM mailboxes WHERE id = ?', [p.data.mailbox_id]);
+  if (!box) return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
+  return NextResponse.json({data: box});
 }
