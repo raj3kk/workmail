@@ -2,13 +2,16 @@ import {NextResponse} from 'next/server';
 import {dbQuery} from '@/lib/db';
 import {requireUser, canAccessMailbox} from '@/lib/guards';
 
-// GET /api/search?mailbox_id=…&q=…[&folder=…][&limit=…][&offset=…]
+// GET /api/search?mailbox_id=…&q=…[&folder=…][&limit=…][&offset=…][&label_id=…]
 //   — server-side search across subject, text body, from and to.
 //   `mailbox_id=all` (E2) searches every mailbox the user can access
 //   (same rule as /api/messages 'all' mode: owners see all mailboxes
 //   in their workspaces; other members see only mailboxes with an
 //   explicit mailbox_members row). Results carry mailbox_id and
 //   workspace_id so the UI can badge which mailbox a hit belongs to.
+//   S3: also matches attachment file names, and accepts the same
+//   `label_id` filter as /api/messages (label must belong to one of
+//   the caller's workspaces, else no results).
 export async function GET(req: Request) {
   const {user, response} = await requireUser(req);
   if (response) return response;
@@ -36,10 +39,30 @@ export async function GET(req: Request) {
   const offsetRaw = Number(u.searchParams.get('offset') || '0');
   const offset = Number.isFinite(offsetRaw) ? Math.max(Math.floor(offsetRaw), 0) : 0;
   const folder = u.searchParams.get('folder');
+  const labelId = u.searchParams.get('label_id');
   const inClause = `mailbox_id IN (${mailboxIds.map(() => '?').join(',')})`;
   const params: unknown[] = [...mailboxIds, like, like, like, like];
   let where = `${inClause}
-       AND (subject LIKE ? ESCAPE '\\' OR text_body LIKE ? ESCAPE '\\' OR from_email LIKE ? ESCAPE '\\' OR to_email LIKE ? ESCAPE '\\')`;
+       AND (subject LIKE ? ESCAPE '\\' OR text_body LIKE ? ESCAPE '\\' OR from_email LIKE ? ESCAPE '\\' OR to_email LIKE ? ESCAPE '\\'
+            OR EXISTS (SELECT 1 FROM message_attachments a WHERE a.message_id = messages.id AND a.file_name LIKE ? ESCAPE '\\'))`;
+  params.push(like);
+  if (labelId) {
+    // S3 (E5-2): same label check as /api/messages — the label must
+    // belong to one of the caller's workspaces, else no results.
+    const memberships = await dbQuery('SELECT workspace_id FROM memberships WHERE user_id = ?', [user.id]);
+    const wsIds = [...new Set(memberships.map((m) => String(m.workspace_id)))];
+    let labelOk = false;
+    if (wsIds.length) {
+      const row = await dbQuery(
+        `SELECT id FROM labels WHERE id = ? AND workspace_id IN (${wsIds.map(() => '?').join(',')})`,
+        [labelId, ...wsIds],
+      );
+      labelOk = row.length > 0;
+    }
+    if (!labelOk) return NextResponse.json({results: [], total: 0, limit, offset, has_more: false});
+    where += ' AND EXISTS (SELECT 1 FROM message_labels ml WHERE ml.message_id = messages.id AND ml.label_id = ?)';
+    params.push(labelId);
+  }
   if (folder) {
     where += ' AND folder = ?';
     params.push(folder);
