@@ -23,9 +23,9 @@
 //   5. Credentials come from the workspace's encrypted-at-rest
 //      `provider_secrets` rows (AES-256-GCM, lib/crypto.ts) first. If a
 //      workspace has no stored secret for a provider, the host-level env
-//      fallback is used (SENDPULSE_API_KEY / SENDPULSE_API_SECRET,
-//      BREVO_API_KEY, MAILJET_API_KEY / MAILJET_API_SECRET,
-//      RESEND_API_KEY). A provider with neither is skipped cleanly and
+//      fallback is used ONLY when workspace_settings.allow_host_provider_fallback
+//      is 1 (G-14; the live owner workspace keeps 1, new workspaces default
+//      to 0). A provider with neither is skipped cleanly and
 //      logged as `unconfigured` — it is never an error.
 //   6. Every attempt is logged as one structured JSON line (provider,
 //      result, latency, cap state). Secrets are never logged.
@@ -74,8 +74,9 @@ export interface ProviderCaps {
   monthly: number | null;
 }
 export const PROVIDER_CAPS: Record<ProviderName, ProviderCaps> = {
-  // 12,000/month; the 50/hour ceiling is the binding constraint at burst.
-  sendpulse: {hourly: 50, daily: null, monthly: 12000},
+  // 12,000/month and 400/day (published free plan); the 50/hour ceiling
+  // is the binding constraint at burst.
+  sendpulse: {hourly: 50, daily: 400, monthly: 12000},
   // 300/day is the only published free-tier ceiling.
   brevo: {hourly: null, daily: 300, monthly: null},
   // 6,000/month and 200/day.
@@ -108,14 +109,19 @@ export interface ProviderSecret {
 
 /**
  * Resolve a provider's credentials: workspace encrypted secret first,
- * host env fallback second. Returns null when the provider is unconfigured
- * (caller skips it cleanly). Never throws for a missing credential.
+ * host env fallback second (only when `allowHostFallback` is true — the
+ * per-workspace gate in workspace_settings.allow_host_provider_fallback,
+ * G-14; default false for new workspaces). Returns null when the provider
+ * is unconfigured (caller skips it cleanly). Never throws for a missing
+ * credential.
  */
 export function resolveProviderSecret(
   provider: ProviderName,
   workspaceSecret: ProviderSecret | null,
+  allowHostFallback = true,
 ): ProviderSecret | null {
   if (workspaceSecret?.api_key) return workspaceSecret;
+  if (!allowHostFallback) return null;
   const vars = PROVIDER_ENV_VARS[provider];
   const key = process.env[vars.key];
   if (!key) return null;
@@ -263,7 +269,9 @@ async function recordAttemptEvent(
         ? 'accepted'
         : result === 'rejected'
           ? 'rejected'
-          : 'unknown';
+          : result === 'unconfigured'
+            ? 'unconfigured'
+            : 'unknown';
     await dbRun(
       `INSERT INTO delivery_events (id, workspace_id, message_id, provider, provider_event_id, event_type, recipient, details, occurred_at, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -584,7 +592,38 @@ export interface ConfiguredProvider {
   provider: ProviderName;
   /** Decrypted workspace secret, or null to use the host env fallback. */
   secret: ProviderSecret | null;
+  /** Provider-confirmed sender (G-25 "Verify now" server check). */
   senderVerified: boolean;
+  /** User-asserted sender (G-25: "I verified sender in provider").
+   *  Sending accepts attested OR verified — attestation is the current
+   *  behaviour and stays eligible; the UI shows the two states honestly. */
+  senderAttested: boolean;
+}
+
+/** SendPulse free-tier message-size limit: 1 MB (G5d). Messages over
+ *  this are never attempted on SendPulse — the chain skips it with a
+ *  logged reason and falls through to the next provider. */
+export const SENDPULSE_MAX_MESSAGE_BYTES = 1 * 1024 * 1024;
+
+/** Approximate wire size of a send: bodies (UTF-8) + attachment bytes. */
+export function messageSizeBytes(d: SendInput): number {
+  let n = Buffer.byteLength(d.text || '') + Buffer.byteLength(d.html || '');
+  for (const a of d.attachments || []) n += a.sizeBytes;
+  return n;
+}
+
+/** Host provider-fallback flag for a workspace (G-14). Missing row or
+ *  missing column (pre-migration) reads as false — the safe default. */
+export async function getHostFallbackAllowed(workspaceId: string): Promise<boolean> {
+  try {
+    const row = await dbOne(
+      'SELECT allow_host_provider_fallback FROM workspace_settings WHERE workspace_id = ?',
+      [workspaceId],
+    );
+    return row ? Number(row.allow_host_provider_fallback) === 1 : false;
+  } catch {
+    return false;
+  }
 }
 
 export interface FallbackAttempt {
@@ -623,6 +662,14 @@ export interface SendWithFallbackOptions {
    * provider call.
    */
   disabledProviders?: ProviderName[];
+  /**
+   * Host env fallback gate (G-14): when false (default), a provider the
+   * workspace has no row for is NOT tried via host env keys — it is
+   * unconfigured. The caller (lib/service-send.ts) reads
+   * workspace_settings.allow_host_provider_fallback; the live owner
+   * workspace keeps true, new workspaces default to false.
+   */
+  allowHostProviderFallback?: boolean;
 }
 
 /**
@@ -664,6 +711,8 @@ export async function sendWithFallback(
   const disabled = new Set<ProviderName>(opts?.disabledProviders ?? []);
   const onlyProvider = opts?.onlyProvider;
   const manual = onlyProvider !== undefined;
+  const allowHostFallback = opts?.allowHostProviderFallback ?? false;
+  const totalSizeBytes = messageSizeBytes(input);
   // Manual pick: exactly one attempt, in that provider's chain position.
   const chain: ProviderName[] = manual ? [onlyProvider] : PROVIDER_CHAIN;
 
@@ -704,17 +753,18 @@ export async function sendWithFallback(
       continue;
     }
     const configured = byName.get(provider);
-    // Workspace rows that are not sender-verified are not eligible; the
-    // env fallback is only used when the workspace has no row at all, so a
-    // workspace that connected a provider but has not verified its sender
-    // does not silently fall back to a host key.
-    if (configured && !configured.senderVerified) {
+    // Workspace rows whose sender is neither provider-verified nor
+    // user-attested are not eligible; the env fallback is only used when
+    // the workspace has no row at all AND the host-fallback gate allows
+    // it, so a workspace that connected a provider but has not verified
+    // its sender does not silently fall back to a host key.
+    if (configured && !configured.senderVerified && !configured.senderAttested) {
       const attempt: FallbackAttempt = {
         provider,
         result: 'unconfigured',
         latency_ms: 0,
         http_status: null,
-        reason: 'provider connected but sender not verified',
+        reason: 'provider connected but sender neither verified nor attested',
         cap: null,
       };
       attempts.push(attempt);
@@ -735,7 +785,11 @@ export async function sendWithFallback(
       });
       continue;
     }
-    const secret = resolveProviderSecret(provider, configured ? configured.secret : null);
+    const secret = resolveProviderSecret(
+      provider,
+      configured ? configured.secret : null,
+      configured ? true : allowHostFallback,
+    );
     if (!secret) {
       const attempt: FallbackAttempt = {
         provider,
@@ -806,6 +860,35 @@ export async function sendWithFallback(
       };
       attempts.push(attempt);
       // Manual pick: honest failure, no call, no durable attempt event.
+      if (manual) return {outcome: 'failed', attempts};
+      logAttempt({
+        workspace_id: workspaceId,
+        idempotency_key: input.idempotencyKey,
+        provider,
+        result: 'cap_exhausted',
+        latency_ms: 0,
+        cap,
+        http_status: null,
+        reason,
+      });
+      await recordAttemptEvent(workspaceId, null, input.to, provider, input.idempotencyKey, 'cap_exhausted', 0, cap, reason);
+      continue;
+    }
+
+    // SendPulse free-tier 1 MB message-size limit (G5d): never attempt
+    // SendPulse for a message over 1 MB — skip it with a logged reason
+    // and fall through to the next provider. Do not attempt-and-fail.
+    if (provider === 'sendpulse' && totalSizeBytes > SENDPULSE_MAX_MESSAGE_BYTES) {
+      const reason = `SendPulse free-tier 1 MB message-size limit exceeded (${totalSizeBytes} bytes); skipped`;
+      const attempt: FallbackAttempt = {
+        provider,
+        result: 'cap_exhausted',
+        latency_ms: 0,
+        http_status: null,
+        reason,
+        cap,
+      };
+      attempts.push(attempt);
       if (manual) return {outcome: 'failed', attempts};
       logAttempt({
         workspace_id: workspaceId,
