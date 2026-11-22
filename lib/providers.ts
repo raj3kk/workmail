@@ -44,6 +44,16 @@ export type ProviderName = 'sendpulse' | 'brevo' | 'mailjet' | 'resend';
 
 export const PROVIDER_CHAIN: ProviderName[] = ['sendpulse', 'brevo', 'mailjet', 'resend'];
 
+/**
+ * True only for the four exact provider strings. Route/service agents
+ * use this to validate a manual-pick `provider` input before calling
+ * sendWithFallback — anything else is not a provider and must be
+ * rejected, never attempted.
+ */
+export function isKnownProvider(v: unknown): v is ProviderName {
+  return v === 'sendpulse' || v === 'brevo' || v === 'mailjet' || v === 'resend';
+}
+
 /** Default priority written when a workspace connects a provider without one. */
 export const PROVIDER_DEFAULT_PRIORITY: Record<ProviderName, number> = {
   sendpulse: 10,
@@ -580,6 +590,29 @@ export type FallbackOutcome =
   | {outcome: 'suppressed'; reason: string; attempts: FallbackAttempt[]}
   | {outcome: 'failed'; attempts: FallbackAttempt[]};
 
+export interface SendWithFallbackOptions {
+  /**
+   * Manual single-provider send (F1/F2): attempt ONLY this provider,
+   * never fall through to another one. A failure — disabled, sender
+   * not verified, cap exhausted, unconfigured, or a definite rejection
+   * — is reported honestly as `failed` with exactly one entry in
+   * `attempts` naming the provider and the reason. An unknown outcome
+   * (timeout) is reported as `unknown`, same as the auto path: stop,
+   * never blind-resend.
+   */
+  onlyProvider?: ProviderName;
+  /**
+   * Providers the workspace has a row for with enabled = 0 (supplied by
+   * the caller, which reads `provider_secrets`). In auto mode such a
+   * provider is skipped ENTIRELY — no logAttempt, no recordAttemptEvent,
+   * no cap check, no env-fallback attempt, no entry in `attempts` — as
+   * if it were never in the chain (B-e). In manual mode a disabled pick
+   * returns `failed` with one skip-reason entry in `attempts` and no
+   * provider call.
+   */
+  disabledProviders?: ProviderName[];
+}
+
 /**
  * Try the chain in order with ONE idempotency key. Stops on the first
  * acceptance, on the first unknown outcome, or on suppression. Definite
@@ -587,19 +620,40 @@ export type FallbackOutcome =
  * the next provider. Never sends to a suppressed recipient, never exceeds
  * a cap, never resends after an unknown outcome.
  *
- * `configs` is the workspace's enabled, sender-verified provider rows in
- * chain order (the caller reads `provider_secrets` and decrypts them).
- * Providers absent from `configs` are still tried via the host env
- * fallback when one exists — the chain order is fixed regardless of
- * workspace priority values.
+ * `configs` is the workspace's enabled provider rows in chain order (the
+ * caller reads `provider_secrets` and decrypts them; rows with
+ * enabled = 0 are NOT in `configs` — they arrive via
+ * `opts.disabledProviders` instead). Providers absent from `configs` are
+ * still tried via the host env fallback when one exists — the chain order
+ * is fixed regardless of workspace priority values — EXCEPT providers
+ * listed in `opts.disabledProviders`, which are never attempted at all.
+ *
+ * `opts.onlyProvider` switches to manual mode: exactly one attempt of
+ * exactly that provider. Pre-call failures (disabled / sender not
+ * verified / cap exhausted / unconfigured) return `failed` with a single
+ * skip-reason entry in `attempts` and NO provider call, NO durable
+ * attempt event — the entry itself is the honest report. A definite
+ * rejection is recorded and returned as `failed`; a timeout is
+ * `unknown`. Nothing ever falls through to another provider.
+ *
+ * RULE 0: a skipped/disabled provider leaves no attempt trace; a manual
+ * pick that fails reports the failure with the provider named. The
+ * `unconfigured` attempt event is kept ONLY for providers that were
+ * never connected AND have no env fallback (genuinely unconfigured).
  */
 export async function sendWithFallback(
   workspaceId: string,
   input: SendInput,
   configs: ConfiguredProvider[],
+  opts?: SendWithFallbackOptions,
 ): Promise<FallbackOutcome> {
   const attempts: FallbackAttempt[] = [];
   const byName = new Map(configs.map((c) => [c.provider, c]));
+  const disabled = new Set<ProviderName>(opts?.disabledProviders ?? []);
+  const onlyProvider = opts?.onlyProvider;
+  const manual = onlyProvider !== undefined;
+  // Manual pick: exactly one attempt, in that provider's chain position.
+  const chain: ProviderName[] = manual ? [onlyProvider] : PROVIDER_CHAIN;
 
   // Attachment metadata, once per send — filename + size only. Bytes and
   // base64 content are NEVER logged, and never appear in error responses.
@@ -616,7 +670,27 @@ export async function sendWithFallback(
     );
   }
 
-  for (const provider of PROVIDER_CHAIN) {
+  for (const provider of chain) {
+    // RULE 0 / B-e: a disabled provider is skipped ENTIRELY in auto mode
+    // — no logAttempt, no recordAttemptEvent, no cap check, no
+    // env-fallback attempt, no entry in `attempts`. It must be as if it
+    // were never in the chain. In manual mode the pick itself is the
+    // report: one skip-reason entry, no provider call, no durable
+    // attempt event.
+    if (disabled.has(provider)) {
+      if (manual) {
+        attempts.push({
+          provider,
+          result: 'unconfigured',
+          latency_ms: 0,
+          http_status: null,
+          reason: 'provider is disabled for this workspace',
+          cap: null,
+        });
+        return {outcome: 'failed', attempts};
+      }
+      continue;
+    }
     const configured = byName.get(provider);
     // Workspace rows that are not sender-verified are not eligible; the
     // env fallback is only used when the workspace has no row at all, so a
@@ -632,6 +706,11 @@ export async function sendWithFallback(
         cap: null,
       };
       attempts.push(attempt);
+      // Manual pick: report honestly and stop — never fall through to
+      // another provider, never call this one. The skip-reason entry in
+      // `attempts` is the report; no durable attempt event is recorded
+      // for a provider that was never called.
+      if (manual) return {outcome: 'failed', attempts};
       logAttempt({
         workspace_id: workspaceId,
         idempotency_key: input.idempotencyKey,
@@ -655,6 +734,12 @@ export async function sendWithFallback(
         cap: null,
       };
       attempts.push(attempt);
+      // Manual pick: honest failure, no call, no durable attempt event
+      // (nothing was attempted). Auto mode keeps the `unconfigured`
+      // attempt event — but only here, i.e. only for a provider that was
+      // never connected AND has no env fallback (genuinely unconfigured).
+      // A disabled provider never reaches this branch (skipped above).
+      if (manual) return {outcome: 'failed', attempts};
       logAttempt({
         workspace_id: workspaceId,
         idempotency_key: input.idempotencyKey,
@@ -708,6 +793,8 @@ export async function sendWithFallback(
         cap,
       };
       attempts.push(attempt);
+      // Manual pick: honest failure, no call, no durable attempt event.
+      if (manual) return {outcome: 'failed', attempts};
       logAttempt({
         workspace_id: workspaceId,
         idempotency_key: input.idempotencyKey,
