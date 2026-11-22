@@ -2,7 +2,7 @@ import {NextResponse} from 'next/server';
 import {dbQuery} from '@/lib/db';
 import {requireUser, canAccessMailbox} from '@/lib/guards';
 
-// GET /api/messages?mailbox_id=…&folder=…[&limit=…][&offset=…][&starred=1]
+// GET /api/messages?mailbox_id=…&folder=…[&limit=…][&offset=…][&starred=1][&label_id=…]
 //   — paginated list, newest first. `limit` defaults to 50 (max 100);
 //     `offset` is a row offset into the same ordering, so "Load more"
 //     appends without re-fetching page 1. Response: {messages, total,
@@ -66,6 +66,7 @@ export async function GET(req: Request) {
   const offsetRaw = Number(u.searchParams.get('offset') || '0');
   const offset = Number.isFinite(offsetRaw) ? Math.max(Math.floor(offsetRaw), 0) : 0;
   const starredOnly = u.searchParams.get('starred') === '1';
+  const labelId = u.searchParams.get('label_id');
   const params: unknown[] = [...mailboxIds];
   let where = `WHERE ${inClause}`;
   if (folder) {
@@ -80,6 +81,27 @@ export async function GET(req: Request) {
   }
   if (starredOnly) {
     where += ' AND is_starred = 1';
+  }
+  // S3 (E5-2): filter the list by label — works in single-mailbox and
+  // All view alike (labels are workspace-scoped; the message list is
+  // already restricted to mailboxes the caller may read). A label id
+  // from a workspace the caller has no membership in matches nothing:
+  // the label row must belong to one of the caller's workspaces, else
+  // the list is empty (no cross-workspace probe signal beyond that).
+  if (labelId) {
+    const memberships = await dbQuery('SELECT workspace_id FROM memberships WHERE user_id = ?', [user.id]);
+    const wsIds = [...new Set(memberships.map((m) => String(m.workspace_id)))];
+    let labelOk = false;
+    if (wsIds.length) {
+      const row = await dbQuery(
+        `SELECT id FROM labels WHERE id = ? AND workspace_id IN (${wsIds.map(() => '?').join(',')})`,
+        [labelId, ...wsIds],
+      );
+      labelOk = row.length > 0;
+    }
+    if (!labelOk) return NextResponse.json({messages: [], total: 0, limit, offset, has_more: false});
+    where += ' AND EXISTS (SELECT 1 FROM message_labels ml WHERE ml.message_id = messages.id AND ml.label_id = ?)';
+    params.push(labelId);
   }
   const totalRows = await dbQuery(`SELECT COUNT(*) AS c FROM messages ${where}`, params);
   const total = Number(totalRows[0]?.c || 0);
