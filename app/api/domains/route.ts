@@ -55,7 +55,7 @@ export async function POST(req: Request) {
       [id, p.data.workspace_id, p.data.domain, 'pending', 'pending', token, user.id, now],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not create domain'}, {status: 400});
+    return NextResponse.json({error: 'Could not create domain'}, {status: 400});
   }
   await dbRun(
     'INSERT INTO audit_events (id, workspace_id, actor_user_id, action, target_type, target_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -110,6 +110,6 @@ export async function PATCH(req: Request) {
     const data = await dbOne('SELECT * FROM domains WHERE id = ?', [d.id]);
     return NextResponse.json({data: data ? stripToken(data) : null});
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'DNS lookup failed'}, {status: 409});
+    return NextResponse.json({error: 'DNS lookup failed'}, {status: 409});
   }
 }
