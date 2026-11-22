@@ -9,11 +9,27 @@ export async function GET(req: Request) {
   if (!user) return NextResponse.json({error: 'Unauthorized'}, {status: 401});
   const ids = await listWorkspaceIds(user.id);
   if (!ids.length) return NextResponse.json({data: []});
-  const data = await dbQuery(
-    `SELECT id, workspace_id, domain_id, address, display_name, is_active, created_at FROM mailboxes
-     WHERE workspace_id IN (${ids.map(() => '?').join(',')}) ORDER BY created_at DESC`,
-    ids,
-  );
+  let data: Array<Record<string, any>>;
+  try {
+    data = await dbQuery(
+      `SELECT id, workspace_id, domain_id, address, display_name, signature, is_active, created_at FROM mailboxes
+       WHERE workspace_id IN (${ids.map(() => '?').join(',')}) ORDER BY created_at DESC`,
+      ids,
+    );
+  } catch (e) {
+    // signature column comes from migration 0007; if it has not been
+    // applied yet, fall back to a query without it (no signature).
+    if (e instanceof Error && /no such column/i.test(e.message)) {
+      data = await dbQuery(
+        `SELECT id, workspace_id, domain_id, address, display_name, is_active, created_at FROM mailboxes
+         WHERE workspace_id IN (${ids.map(() => '?').join(',')}) ORDER BY created_at DESC`,
+        ids,
+      );
+      for (const b of data) b.signature = '';
+    } else {
+      throw e;
+    }
+  }
   return NextResponse.json({data});
 }
 
@@ -76,7 +92,14 @@ export async function PATCH(req: Request) {
   const p = z
     .object({
       mailbox_id: z.string().uuid(),
-      display_name: z.string().max(100),
+      // Either field may be updated on its own: display_name (Settings
+      // display-name editor) or signature (E5-10, Settings → Mailbox
+      // signatures). At least one must be present.
+      display_name: z.string().max(100).optional(),
+      signature: z.string().max(2000).optional(),
+    })
+    .refine((d) => d.display_name !== undefined || d.signature !== undefined, {
+      message: 'display_name or signature required',
     })
     .safeParse(await req.json().catch(() => null));
   if (!p.success) return NextResponse.json({error: 'Invalid mailbox update'}, {status: 400});
@@ -87,12 +110,19 @@ export async function PATCH(req: Request) {
   // Trimmed value stored as given. Empty string means "use default" — the
   // effective From name ('Flow99' when blank) is resolved in one place,
   // lib/service-send.ts, never coerced here.
-  const displayName = p.data.display_name.trim();
   try {
-    await dbRun('UPDATE mailboxes SET display_name = ? WHERE id = ?', [
-      displayName,
-      p.data.mailbox_id,
-    ]);
+    if (p.data.display_name !== undefined) {
+      await dbRun('UPDATE mailboxes SET display_name = ? WHERE id = ?', [
+        p.data.display_name.trim(),
+        p.data.mailbox_id,
+      ]);
+    }
+    if (p.data.signature !== undefined) {
+      await dbRun('UPDATE mailboxes SET signature = ? WHERE id = ?', [
+        p.data.signature.trim(),
+        p.data.mailbox_id,
+      ]);
+    }
   } catch (e) {
     return NextResponse.json({error: e instanceof Error ? e.message : 'Could not update mailbox'}, {status: 400});
   }
