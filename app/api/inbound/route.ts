@@ -6,6 +6,7 @@ import {kvPut, kvDelete} from '@/lib/kv';
 import {maybeAutoReply} from '@/lib/ai';
 import {applyMailRules} from '@/lib/filters';
 import {autoMirrorMessage} from '@/lib/gmail-mirror';
+import {checkSpamInbound} from '@/lib/email-validation';
 
 export const runtime = 'nodejs';
 
@@ -205,12 +206,35 @@ export async function POST(req: Request) {
   } catch {
     // Filters must never break inbound delivery.
   }
+  // Spam handling (E5-13): server-side blocklist + Junk folder move.
+  // Runs AFTER user mail filters, so it is the final say — but only
+  // when the message is still in the inbox (a filter that already moved
+  // it is respected). Conservative scoring (lib/email-validation.ts):
+  // a known spam sender domain, or >= 2 pattern hits. No ML classifier
+  // exists on the free tier — docs/BACKUP.md says so honestly.
+  let spamMoved = false;
+  let spamMatched: string[] = [];
+  try {
+    const spam = checkSpamInbound({from: d.from, subject: d.subject || '(No Subject)', text: textBody, html: d.html || ''});
+    if (spam.isSpam) {
+      spamMatched = spam.matched;
+      const moved = await dbRun("UPDATE messages SET folder = 'spam' WHERE id = ? AND folder = 'inbox'", [messageId]);
+      spamMoved = moved.changes === 1;
+      if (spamMoved)
+        console.log(JSON.stringify({event: 'inbound_spam_moved', workspace_id: String(box.workspace_id), message_id: messageId, from: d.from, matched: spam.matched}));
+    }
+  } catch {
+    // Spam classification must never break inbound delivery.
+  }
   const period = new Date().toISOString().slice(0, 7) + '-01';
+  // Storage accounting (G-4): real bytes stored for this message — the
+  // bodies (UTF-8) + the attachment bytes actually stored in KV.
+  const bodyBytes = Buffer.byteLength(textBody) + Buffer.byteLength(d.html || '');
   await dbRun(
     `INSERT INTO usage_counters (workspace_id, period_start, sent_count, received_count, storage_bytes)
      VALUES (?, ?, 0, 1, ?)
      ON CONFLICT(workspace_id, period_start) DO UPDATE SET received_count = usage_counters.received_count + 1, storage_bytes = usage_counters.storage_bytes + excluded.storage_bytes`,
-    [box.workspace_id, period, storedBytes],
+    [box.workspace_id, period, storedBytes + bodyBytes],
   );
   // Phase 4 Gmail backup mirror — auto-mirror hook (best-effort, never
   // throws, never changes the 202 acceptance of the inbound message).
@@ -235,7 +259,7 @@ export async function POST(req: Request) {
     // Auto-reply must never break inbound delivery.
   }
   return NextResponse.json(
-    {accepted: true, thread_id: thread.threadId, attachments_stored: storedAttachments},
+    {accepted: true, thread_id: thread.threadId, attachments_stored: storedAttachments, spam_moved: spamMoved, spam_matched: spamMatched},
     {status: 202},
   );
 }
