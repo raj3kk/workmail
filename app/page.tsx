@@ -27,6 +27,22 @@ function deliveryBadge(m:Mail):string{
 }
 // True only for a row the provider actually accepted.
 function isAcceptedRow(m:any):boolean{const s=String(m?.delivery_state||"").toLowerCase();return s==="accepted"||s==="sent"||s==="delivered"||s==="opened"||s==="clicked"||s==="deferred";}
+// Sign-in failure messages (BUGFIX 2026-11-22): the callback redirects
+// here with ?auth=error&reason=<reason>; the login card shows the
+// plain-words reason instead of a bare login screen. Never a bare
+// redirect again.
+const AUTH_ERROR_MESSAGES: Record<string, string> = {
+  access_denied: "Google did not approve the sign-in — you may have cancelled, or Google showed a warning about this app. If you saw an 'unverified app' warning, the app's Google verification is still pending; try again, or contact the WorkMail owner.",
+  google_error: "Google returned an error during sign-in. Try again — if it keeps happening, contact the WorkMail owner.",
+  no_code: "Google sent us back without a sign-in code. Try again.",
+  state_mismatch: "Your sign-in session expired or the browser blocked the sign-in cookie. Try again — if it keeps failing, allow cookies for this site or try another browser.",
+  rate_limited: "Too many sign-in attempts. Wait a minute and try again.",
+  token_failed: "Google could not complete the sign-in (token exchange failed). Try again — if it keeps happening, contact the WorkMail owner.",
+  userinfo_failed: "Google could not share your profile. Try again.",
+  email_not_verified: "Google says this email address is not verified. Verify it in your Google Account, then try again.",
+  account_failed: "Your WorkMail account could not be created. Try again — if it keeps happening, contact the WorkMail owner.",
+  default: "Sign-in failed. Try again — if it keeps happening, contact the WorkMail owner.",
+};
 export default function Home(){
  const [user,setUser]=useState<any>(null),[loading,setLoading]=useState(true),[sessionError,setSessionError]=useState(""),[folder,setFolder]=useState("inbox"),[messages,setMessages]=useState<Mail[]>([]),[total,setTotal]=useState(0),[hasMore,setHasMore]=useState(false),[loadingMore,setLoadingMore]=useState(false),[active,setActive]=useState<Mail|null>(null),[search,setSearch]=useState(""),[searchResults,setSearchResults]=useState<Mail[]|null>(null),[compose,setCompose]=useState(false),[to,setTo]=useState(""),[subject,setSubject]=useState(""),[body,setBody]=useState(""),[busy,setBusy]=useState(false),[notice,setNotice]=useState(""),[mailboxes,setMailboxes]=useState<any[]>([]),[mailboxId,setMailboxId]=useState(""),[workspaceId,setWorkspaceId]=useState(""),[aiStatus,setAiStatus]=useState<any>(null),[aiBusy,setAiBusy]=useState(false),[aiPrompt,setAiPrompt]=useState(""),[aiQueue,setAiQueue]=useState<any[]>([]),[autoReply,setAutoReply]=useState(false),[isNarrow,setIsNarrow]=useState(false);
  const [counts,setCounts]=useState<Record<string,number>>({}),[starredOnly,setStarredOnly]=useState(false),[labels,setLabels]=useState<Label[]>([]),[newLabel,setNewLabel]=useState(""),[thread,setThread]=useState<Mail[]|null>(null),[threadOpen,setThreadOpen]=useState(false),[draftId,setDraftId]=useState<string|null>(null),[draftSaved,setDraftSaved]=useState(""),[replyThreadId,setReplyThreadId]=useState<string|null>(null),[replyInReplyTo,setReplyInReplyTo]=useState<string|null>(null),[attachFiles,setAttachFiles]=useState<any[]>([]),[sendProvider,setSendProvider]=useState("auto");
@@ -69,7 +85,7 @@ export default function Home(){
  // A fresh compose session starts unsent.
  useEffect(()=>{if(compose)sentRef.current=false;},[compose]);
  useEffect(()=>{const q=window.matchMedia("(max-width: 850px)");const f=()=>setIsNarrow(q.matches);f();q.addEventListener("change",f);return ()=>q.removeEventListener("change",f);},[]);
- useEffect(()=>{fetch("/api/auth/session").then(r=>r.json()).then(s=>{setUser(s.user||null);const w=s.workspaces?.[0];if(w?.id)setWorkspaceId(w.id);setLoading(false);}).catch(e=>{setSessionError(e?.message||"Could not reach the server. Check your connection and try again.");setLoading(false);});},[]);
+ useEffect(()=>{const q=new URLSearchParams(window.location.search);if(q.get("auth")==="error"){const r=q.get("reason")||"default";setSessionError(AUTH_ERROR_MESSAGES[r]||AUTH_ERROR_MESSAGES.default);}fetch("/api/auth/session").then(r=>r.json()).then(s=>{setUser(s.user||null);const w=s.workspaces?.[0];if(w?.id)setWorkspaceId(w.id);setLoading(false);}).catch(e=>{setSessionError(e?.message||"Could not reach the server. Check your connection and try again.");setLoading(false);});},[]);
  // Toast auto-dismiss (L-08): the notice clears itself after 7s.
  useEffect(()=>{if(!notice)return;const t=setTimeout(()=>setNotice(""),7000);return ()=>clearTimeout(t);},[notice]);
  async function loadBoxes(){const r=await fetch("/api/mailboxes");const d=await r.json();setMailboxes(d.data||[]);if(!mailboxId&&d.data?.[0])setMailboxId(d.data[0].id);}
