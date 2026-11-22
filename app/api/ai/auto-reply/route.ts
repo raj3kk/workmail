@@ -32,8 +32,10 @@ export async function GET(req: Request) {
   if (!mailboxId) return NextResponse.json({error: 'mailbox_id required'}, {status: 400});
   const box = await dbOne('SELECT id, workspace_id FROM mailboxes WHERE id = ?', [mailboxId]);
   if (!box) return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
+  // P-02: 404 (not 403) on denial, so a cross-tenant mailbox-id probe
+  // cannot confirm another tenant's mailbox exists by the status code.
   if (!(await canAccessMailbox(user.id, mailboxId, false)))
-    return NextResponse.json({error: 'Mailbox access denied'}, {status: 403});
+    return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
   const setting = await getAutoReplySetting(mailboxId);
   const queue = (await getReviewQueue(String(box.workspace_id))).filter(
     (q) => q.mailbox_id === mailboxId,
@@ -64,8 +66,9 @@ export async function POST(req: Request) {
     const box = await dbOne('SELECT id, workspace_id FROM mailboxes WHERE id = ?', [toggle.data.mailbox_id]);
     if (!box) return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
     const role = await workspaceRole(user.id, String(box.workspace_id));
+    // P-02: 404 (not 403) on denial — see GET above.
     if (!role || !['owner', 'admin'].includes(role))
-      return NextResponse.json({error: 'Owner or admin permission required'}, {status: 403});
+      return NextResponse.json({error: 'Mailbox not found'}, {status: 404});
     const setting = await setAutoReplySetting(toggle.data.mailbox_id, toggle.data.enabled, user.id);
     await logAiAction({
       action: 'ai.auto_reply_toggled',
