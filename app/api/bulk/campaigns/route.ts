@@ -20,6 +20,7 @@ import {
   loadSuppressionMap,
   monthlySendRemaining,
 } from '@/lib/bulk';
+import {extractTemplateVariables, getTemplate} from '@/lib/templates';
 
 export const runtime = 'nodejs';
 
@@ -34,7 +35,7 @@ const createSchema = z
     workspace_id: z.string().uuid(),
     mailbox_id: z.string().uuid(),
     name: z.string().max(200).optional().default(''),
-    subject: z.string().min(1).max(998),
+    subject: z.string().max(998).optional().default(''),
     text: z.string().max(100000).optional().default(''),
     html: z.string().max(200000).optional().default(''),
     recipients: z.array(recipientSchema).min(1).max(BULK_MAX_RECIPIENTS),
@@ -42,8 +43,14 @@ const createSchema = z
     // provider name = ONLY that provider, no silent fallback (enforced
     // in the send engine). Stored on the campaign row.
     provider: z.enum(['auto', 'sendpulse', 'brevo', 'mailjet', 'resend']).optional().default('auto'),
+    // Template to render per recipient at send time (Phase 1). When set,
+    // the campaign's stored text/html are the creation-time snapshot;
+    // the runner renders the template row instead. Subject still comes
+    // from the request (defaults to the template subject when empty).
+    template_id: z.string().uuid().optional(),
   })
-  .refine((x) => !!(x.text || x.html), {message: 'Provide a text body, an HTML body, or both.'});
+  .refine((x) => !!(x.text || x.html || x.template_id), {message: 'Provide a text body, an HTML body, or a template.'})
+  .refine((x) => !!(x.subject || x.template_id), {message: 'Provide a subject, or pick a template that has one.'});
 
 export async function GET(req: Request) {
   const {user, response} = await requireUser(req);
@@ -128,10 +135,39 @@ export async function POST(req: Request) {
 
   const campaignId = newId();
   const now = nowIso();
+  // Template validation (Phase 1): the template must belong to this
+  // workspace, and every variable it uses must be suppliable per
+  // recipient (a sheet column, email/name, or the automatic
+  // sender_name/unsubscribe_url). {{otp}} / {{action_url}} have no
+  // per-recipient value in bulk, so a campaign using them is rejected
+  // here — not one failed recipient at a time at send time.
+  let templateSubject = '';
+  if (d.template_id) {
+    const template = await getTemplate(d.workspace_id, d.template_id);
+    if (!template)
+      return NextResponse.json({error: 'Template not found for this workspace.'}, {status: 404});
+    templateSubject = template.subject;
+    const known = new Set<string>(['email', 'name', 'sender_name', 'unsubscribe_url']);
+    for (const r of d.recipients) for (const k of Object.keys(r.fields || {})) known.add(k.toLowerCase());
+    const needed = [
+      ...new Set([...extractTemplateVariables(template.subject), ...extractTemplateVariables(template.html_body), ...extractTemplateVariables(template.text_body)]),
+    ];
+    const missing = needed.filter((v) => !known.has(v));
+    if (missing.length > 0)
+      return NextResponse.json(
+        {
+          error: `This template uses variable(s) a bulk campaign cannot supply: ${missing.map((v) => `{{${v}}}`).join(', ')}. Pick a template that only uses recipient columns, {{name}}, {{email}}, {{sender_name}} and {{unsubscribe_url}}.`,
+        },
+        {status: 400},
+      );
+  }
+  const subject = d.subject.trim() ? d.subject : templateSubject;
+  if (!subject)
+    return NextResponse.json({error: 'Provide a subject (or pick a template that has one).'}, {status: 400});
   await dbRun(
-    `INSERT INTO bulk_campaigns (id, workspace_id, mailbox_id, created_by, name, subject, text_body, html_body, provider, status, total_recipients, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`,
-    [campaignId, d.workspace_id, d.mailbox_id, user.id, d.name, d.subject, d.text, d.html, d.provider, valid.length, now, now],
+    `INSERT INTO bulk_campaigns (id, workspace_id, mailbox_id, created_by, name, subject, text_body, html_body, provider, template_id, status, total_recipients, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`,
+    [campaignId, d.workspace_id, d.mailbox_id, user.id, d.name, subject, d.text, d.html, d.provider, d.template_id || null, valid.length, now, now],
   );
   for (const r of valid) {
     await dbRun(
