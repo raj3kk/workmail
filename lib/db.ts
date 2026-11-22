@@ -26,6 +26,11 @@ async function callD1(body: unknown): Promise<any> {
     {method: 'POST', headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'}, body: JSON.stringify(body), cache: 'no-store', signal: AbortSignal.timeout(15000)});
   const j = await r.json().catch(() => null);
   if (!r.ok || !j?.success) {
+    // P-03: this message comes from the Cloudflare API and can name
+    // tables, constraints, or SQL text (internal detail). It is for
+    // SERVER LOGS ONLY — no API route may return it verbatim to a
+    // client; every catch that answers a request uses a static
+    // fallback string instead.
     const msg = j?.errors?.map((e: any) => e.message).join('; ') || `D1 request failed (HTTP ${r.status})`;
     throw new Error(msg);
   }
