@@ -43,7 +43,7 @@ export async function POST(req: Request) {
       ],
     );
   } catch (e) {
-    return NextResponse.json({error: e instanceof Error ? e.message : 'Could not record payment event'}, {status: 400});
+    return NextResponse.json({error: 'Could not record payment event'}, {status: 400});
   }
   if (b.verified === true && b.event_type === 'payment_succeeded') {
     await dbRun('UPDATE invoices SET status = ?, payment_reference = ?, paid_at = ? WHERE id = ?', [
