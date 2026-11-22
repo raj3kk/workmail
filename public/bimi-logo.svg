@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Flow99 BIMI logo — SVG Tiny 1.2, square 512x512, no scripts, no external references, no animation. -->
+<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" viewBox="0 0 512 512" width="512" height="512">
+  <title>Flow99</title>
+  <rect x="0" y="0" width="512" height="512" fill="#1f2a5c"/>
+  <rect x="24" y="24" width="464" height="464" rx="56" fill="#2e4a9e"/>
+  <text x="256" y="300" font-family="Arial, Helvetica, sans-serif" font-size="200" font-weight="bold" fill="#ffffff" text-anchor="middle">99</text>
+  <text x="256" y="392" font-family="Arial, Helvetica, sans-serif" font-size="52" font-weight="bold" fill="#a7bdff" text-anchor="middle" letter-spacing="4">Flow99</text>
+</svg>
