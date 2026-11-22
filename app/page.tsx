@@ -74,7 +74,7 @@ export default function Home(){
  useEffect(()=>{if(!notice)return;const t=setTimeout(()=>setNotice(""),7000);return ()=>clearTimeout(t);},[notice]);
  async function loadBoxes(){const r=await fetch("/api/mailboxes");const d=await r.json();setMailboxes(d.data||[]);if(!mailboxId&&d.data?.[0])setMailboxId(d.data[0].id);}
  useEffect(()=>{if(user)loadBoxes();},[user]);
- useEffect(()=>{if(!user)return;fetch("/api/ai/status").then(r=>r.json()).then(s=>setAiStatus(s)).catch(()=>{});},[user]);
+ useEffect(()=>{if(!user||!workspaceId)return;fetch(`/api/ai/status?workspace_id=${encodeURIComponent(workspaceId)}`).then(r=>r.json()).then(s=>setAiStatus(s)).catch(()=>{});},[user,workspaceId]);
  async function loadAi(){if(!mailboxId||mailboxId==="all")return;const r=await fetch(`/api/ai/auto-reply?mailbox_id=${encodeURIComponent(mailboxId)}`);const d=await r.json();if(r.ok){setAutoReply(!!d.auto_reply?.enabled);setAiQueue(d.queue||[]);}}
  useEffect(()=>{if(user&&mailboxId)loadAi();},[user,mailboxId]);
  async function loadCounts(){if(!mailboxId)return;const r=await fetch(`/api/messages?mailbox_id=${encodeURIComponent(mailboxId)}&counts=1`);const d=await r.json();if(r.ok)setCounts(d.counts||{});}
