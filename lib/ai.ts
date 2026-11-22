@@ -537,6 +537,57 @@ async function setThreadMarker(
 }
 
 // --- Inbound auto-reply hook -------------------------------------------------
+// Automated / bounce senders an AI auto-reply must NEVER transmit to
+// (2026-11-22: four replies went to provider bounce addresses because
+// the worker passed the SMTP envelope sender as the From). Such mail is
+// not drafted or sent at all — the human reads it in the inbox.
+const AUTO_REPLY_BLOCKED_DOMAINS = ['sender-sib.com', 'bnc3.mailjet.com', 'gaia.bounces.google.com', 'amazonses.com'];
+function isAutomatedSender(addr: string): boolean {
+  const a = addr.toLowerCase().trim();
+  const local = a.split('@')[0] || '';
+  const domain = a.split('@')[1] || '';
+  if (local.startsWith('bounces-') || local.startsWith('bounce-')) return true;
+  if (['mailer-daemon', 'postmaster', 'noreply', 'no-reply', 'donotreply', 'do-not-reply'].includes(local)) return true;
+  if (local.includes('bounce') || domain.includes('bounce')) return true;
+  return AUTO_REPLY_BLOCKED_DOMAINS.some((d) => domain === d || domain.endsWith('.' + d));
+}
+// Plain text from an HTML body when the plain-text part is empty
+// (provider-sent mail is often HTML-only; the model answered "I can't
+// find any information" on an empty body, 2026-11-22).
+function plainTextFromHtml(html: string): string {
+  return html
+    .replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+// The model is told to write [NEEDS HUMAN INPUT] instead of guessing,
+// but nothing ever checked the output before transmitting (2026-11-22:
+// "I'm not able to find any information about the original message…"
+// was sent as-is). A draft that is not a real answer is queued for
+// human review, never transmitted.
+const NON_ANSWER_PATTERNS = [
+  'needs human input',
+  'not able to find any information',
+  'unable to find any information',
+  "i don't have enough information",
+  'i do not have enough information',
+  'please provide more context',
+  'could you provide more',
+  'need more information',
+  'more details are needed',
+];
+function looksLikeNonAnswer(text: string): boolean {
+  const t = text.toLowerCase();
+  return NON_ANSWER_PATTERNS.some((p) => t.includes(p));
+}
+
 // Called by /api/inbound after a message is stored. NEVER throws: any
 // failure is swallowed by the caller so inbound delivery is unaffected.
 // Behaviour:
@@ -550,6 +601,15 @@ async function setThreadMarker(
 //     `sent` with provider + timestamp.
 //   - Thread already auto-replied (or mail from the mailbox itself) ->
 //     draft + queue only, no transmission (human review can still send).
+//   - Automated / bounce senders (provider Return-Path addresses) and
+//     any of the workspace's own mailboxes -> nothing is drafted or
+//     sent (2026-11-22: four replies went to bounce addresses because
+//     the worker passed the SMTP envelope sender as the From).
+//   - Empty body (HTML-only mail with no plain-text part) -> nothing
+//     is drafted or sent; the mail waits in the inbox for a human.
+//   - Generated text that is not a real answer ([NEEDS HUMAN INPUT]
+//     or a "can't find any information" style reply) -> drafted +
+//     queued only, never transmitted.
 //   - Toggle ON + AI not configured / provider error -> no draft, no fake
 //     reply; the failure is logged (metadata only) and the inbound mail
 //     itself is unaffected.
@@ -564,18 +624,36 @@ export async function maybeAutoReply(input: {
   mailboxAddress: string;
   messageId: string;
   from: string;
+  /** MIME Reply-To header (the real reply target); falls back to `from`. */
+  replyTo?: string;
+  /** HTML body, used for a plain-text fallback when `body` is empty. */
+  html?: string;
+  /** All of the workspace's mailbox addresses (own-mail skip). */
+  ownAddresses?: string[];
   subject: string;
   body: string;
 }): Promise<{drafted: boolean; draftId?: string; sent?: boolean; provider?: string | null; reason?: string}> {
   try {
     const setting = await getAutoReplySetting(input.mailboxId);
     if (!setting.enabled) return {drafted: false, reason: 'auto-reply off'};
-    // Never auto-reply to the mailbox itself (loop protection).
-    if (input.from.toLowerCase() === input.mailboxAddress.toLowerCase())
-      return {drafted: false, reason: 'self-mail'};
+    // Reply target: the MIME Reply-To header when present, else the
+    // header From. The SMTP envelope sender (Return-Path) is a bounce
+    // address for provider-sent mail and must never be replied to.
+    const replyTarget = (input.replyTo || input.from).trim();
+    // Never draft or send to automated / bounce addresses, and never
+    // to any of the workspace's own mailboxes (loop protection,
+    // stronger than the old single-mailbox check).
+    const own = new Set((input.ownAddresses || [input.mailboxAddress]).map((a) => a.toLowerCase()));
+    if (isAutomatedSender(replyTarget) || own.has(replyTarget.toLowerCase()))
+      return {drafted: false, reason: 'automated-or-own-sender'};
+    // Plain-text fallback: provider-sent mail is often HTML-only, and
+    // the model answered "I can't find any information" on an empty
+    // body (2026-11-22). Still empty -> wait for a human.
+    const effectiveBody = input.body?.trim() ? input.body : input.html ? plainTextFromHtml(input.html) : '';
+    if (!effectiveBody.trim()) return {drafted: false, reason: 'empty-body'};
     const cfg = aiConfig();
     if (!cfg.configured) return {drafted: false, reason: 'ai-not-configured'};
-    const threadKey = autoReplyThreadKey(input.from, input.subject);
+    const threadKey = autoReplyThreadKey(replyTarget, input.subject);
     const threadBlocked = (await getThreadMarker(input.mailboxId, threadKey)) !== null;
     let text: string;
     let trainingUsed: TrainingUsage = {entryIds: [], chars: 0, totalEntries: 0};
@@ -587,12 +665,12 @@ export async function maybeAutoReply(input: {
       // plain prompt (generateDraftText handles it); drafting continues.
       const out = await generateDraftText(
         buildReplyPrompt({
-          from: input.from,
+          from: replyTarget,
           subject: input.subject,
-          body: input.body,
+          body: effectiveBody,
           mailboxAddress: input.mailboxAddress,
         }),
-        {workspaceId: input.workspaceId, inboundText: `${input.subject}\n${input.body}`},
+        {workspaceId: input.workspaceId, inboundText: `${input.subject}\n${effectiveBody}`},
       );
       text = out.text;
       trainingUsed = out.trainingUsed;
@@ -614,7 +692,7 @@ export async function maybeAutoReply(input: {
       workspaceId: input.workspaceId,
       mailboxId: input.mailboxId,
       fromAddress: input.mailboxAddress,
-      to: input.from,
+      to: replyTarget,
       subject,
       text,
     });
@@ -622,7 +700,7 @@ export async function maybeAutoReply(input: {
       draft_id: draftId,
       source_message_id: input.messageId,
       mailbox_id: input.mailboxId,
-      to: input.from,
+      to: replyTarget,
       subject,
       auto: true,
       status: 'pending',
@@ -639,10 +717,17 @@ export async function maybeAutoReply(input: {
       provider: cfg.provider,
       training: {count: trainingUsed.entryIds.length, entryIds: trainingUsed.entryIds},
     });
-    if (threadBlocked) {
-      // Drafted + queued for human review, but NOT transmitted: this
-      // thread already received one auto-reply.
-      return {drafted: true, draftId, sent: false, reason: 'thread-already-auto-replied'};
+    if (threadBlocked || looksLikeNonAnswer(text)) {
+      // Drafted + queued for human review, but NOT transmitted: either
+      // this thread already received one auto-reply, or the generated
+      // text is not a real answer (2026-11-22: a confused "I can't
+      // find any information" draft was transmitted as-is).
+      return {
+        drafted: true,
+        draftId,
+        sent: false,
+        reason: threadBlocked ? 'thread-already-auto-replied' : 'non-answer-draft',
+      };
     }
     // Transmit via the service send path. Deterministic idempotency key
     // = max 1 auto-reply per inbound message, even on retry.
@@ -651,7 +736,7 @@ export async function maybeAutoReply(input: {
       exec = await executeServiceSend({
         workspaceId: input.workspaceId,
         mailboxId: input.mailboxId,
-        to: input.from,
+        to: replyTarget,
         subject,
         text,
         idempotencyKey: `ai-auto-reply:${input.messageId}`,
