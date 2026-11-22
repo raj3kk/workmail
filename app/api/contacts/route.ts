@@ -1,6 +1,7 @@
 import {NextResponse} from 'next/server';
 import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
 import {requireUser, workspaceRole} from '@/lib/guards';
+import {isDisposableEmail} from '@/lib/email-validation';
 
 export async function GET(req: Request) {
   const {user, response} = await requireUser(req);
@@ -24,6 +25,13 @@ export async function POST(req: Request) {
   const b = await req.json().catch(() => null);
   if (!b || typeof b.workspace_id !== 'string' || typeof b.email !== 'string' || !/^\S+@\S+\.\S+$/.test(b.email))
     return NextResponse.json({error: 'Valid workspace_id and email required'}, {status: 400});
+  // G-12: disposable / temporary-mail addresses cannot be saved as a
+  // contact. Rejected with a clear message, never silently dropped.
+  if (isDisposableEmail(b.email))
+    return NextResponse.json(
+      {error: 'Disposable or temporary email addresses cannot be saved as contacts. Use the real email address.'},
+      {status: 400},
+    );
   const role = await workspaceRole(user.id, b.workspace_id);
   if (!role || !['owner', 'admin'].includes(role))
     return NextResponse.json({error: 'Workspace admin required'}, {status: 403});
