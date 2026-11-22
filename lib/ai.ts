@@ -588,6 +588,18 @@ function looksLikeNonAnswer(text: string): boolean {
   return NON_ANSWER_PATTERNS.some((p) => t.includes(p));
 }
 
+/**
+ * The model writes [NEEDS HUMAN INPUT] where it cannot know a fact.
+ * That marker is an internal signal, never user-facing text: it leaked
+ * verbatim into a queued auto-reply draft and a bulk AI draft on
+ * 2026-11-22. Replace it before the text is stored or transmitted.
+ * Detection (looksLikeNonAnswer) must run on the RAW text first — the
+ * marker IS the signal — so callers detect, then sanitize.
+ */
+export function sanitizeAiMarker(text: string, replacement: string): string {
+  return (text || '').replace(/\[NEEDS HUMAN INPUT\]/gi, replacement);
+}
+
 // Called by /api/inbound after a message is stored. NEVER throws: any
 // failure is swallowed by the caller so inbound delivery is unaffected.
 // Behaviour:
@@ -687,6 +699,11 @@ export async function maybeAutoReply(input: {
       });
       return {drafted: false, reason: e instanceof Error ? e.message : 'ai-provider-error'};
     }
+    // Detect the non-answer on the RAW text first (the marker is the
+    // signal), then strip the marker before the draft is stored or
+    // transmitted.
+    const isNonAnswer = looksLikeNonAnswer(text);
+    text = sanitizeAiMarker(text, 'I’ll need to check that detail — a team member will follow up.');
     const subject = input.subject.startsWith('Re: ') ? input.subject : `Re: ${input.subject || '(No Subject)'}`;
     const draftId = await saveAiDraft({
       workspaceId: input.workspaceId,
@@ -717,7 +734,7 @@ export async function maybeAutoReply(input: {
       provider: cfg.provider,
       training: {count: trainingUsed.entryIds.length, entryIds: trainingUsed.entryIds},
     });
-    if (threadBlocked || looksLikeNonAnswer(text)) {
+    if (threadBlocked || isNonAnswer) {
       // Drafted + queued for human review, but NOT transmitted: either
       // this thread already received one auto-reply, or the generated
       // text is not a real answer (2026-11-22: a confused "I can't
