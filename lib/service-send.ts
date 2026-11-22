@@ -53,6 +53,7 @@ import {
   type SendAttachment,
 } from '@/lib/providers';
 import {
+  brandTemplateHtml,
   buildUnsubscribeMailto,
   deriveBrandFromDomain,
   getTemplate,
@@ -508,6 +509,15 @@ export async function executeSend(input: ExecuteSendInput, actor: SendActor): Pr
         });
       throw e;
     }
+  }
+  // Branded header (2026-11-22): custom templates never carried the
+  // logo header — only the 5 seeded defaults bake it into their stored
+  // html_body — so real template sends went out with NO logo while
+  // test-sends looked branded. Wrap template sends that lack it;
+  // brandTemplateHtml skips already-branded HTML (defaults), so
+  // nothing double-wraps. Plain-text bodies are untouched.
+  if (input.templateId && finalHtml) {
+    finalHtml = brandTemplateHtml(finalHtml, fromName);
   }
   // Mailbox signature (E5-10, centralised at merge): appended server-side
   // to EVERY outbound send from this mailbox — compose, bulk, v1 API and
