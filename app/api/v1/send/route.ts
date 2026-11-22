@@ -1,11 +1,12 @@
 import {NextResponse} from 'next/server';
 import {z} from 'zod';
-import {randomUUID} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {dbOne, dbRun, newId, nowIso} from '@/lib/db';
 import {authenticateApiKeyWithScope} from '@/lib/api-auth';
 import {checkRateLimit, rateLimitResponse, V1_RATE_LIMITS} from '@/lib/rate-limit';
-import {executeSend, type SendExecution} from '@/lib/service-send';
+import {executeSend, type SendAttachmentRef, type SendExecution} from '@/lib/service-send';
 import {computeNextAttemptIso} from '@/lib/retry';
+import {kvDelete, kvPut} from '@/lib/kv';
 
 export const runtime = 'nodejs';
 
@@ -27,12 +28,79 @@ export const runtime = 'nodejs';
 // in_reply_to (the Message-ID being answered) when replying, exactly
 // as /api/send does; without them the send starts a new thread.
 //
-// NOTE on template_id: the field is accepted and validated here, but
-// template rendering lives in lib/service-send.ts, which Phase 1 owns
-// in parallel — until that lands, a request carrying template_id gets
-// a clear 400 instead of silently sending untemplated mail. The
-// coordinator wires it when Phase 1 merges; nothing else in this
-// route needs to change.
+// Attachments (E5-6): two forms are accepted in the same `attachments`
+// array (max 10 entries total):
+//   1. Inline base64 (the simple integrator path):
+//      {filename, content_type, content_base64}. Each file <= 2 MB
+//      decoded, total <= 1 MB decoded (413 above). The file type must
+//      be on the same allow-list as the UI upload path
+//      (POST /api/attachments). Decoded bytes are stored in KV with
+//      the EXACT same mechanism as the UI compose flow
+//      (`att/<workspaceId>/<mailboxId>/...`, kvPut) and handed to
+//      executeSend as object_key refs — no second attachment
+//      pipeline. The KV key is derived from the content SHA-256 (not
+//      a fresh UUID) so a retry with the same idempotency key and the
+//      same content resolves to the same object_key: otherwise the
+//      idempotency hash would differ and a legitimate retry would 409.
+//   2. KV refs (the pre-uploaded form, as in Phase 2):
+//      {attachment_id} or {object_key, file_name, content_type,
+//      size_bytes} — resolved by lib/service-send.ts exactly as for
+//      the UI path (10 MB total, 25 MB per file).
+// Templates (Phase 1, live): template_id + variables are passed
+// straight through to executeSend, exactly as POST /api/send does.
+// The stored template supplies subject + html/text (the caller's
+// text/html are ignored when template_id is set); an unknown
+// template variable rejects with 400 from the render, and a missing
+// template with 409 — both before the idempotency key is reserved.
+
+// API attachment caps (E5-6): stricter than the UI path (10 MB total /
+// 25 MB per file) because the base64 form travels inside the JSON
+// body and the smallest free provider message cap (SendPulse, 1 MB)
+// bounds what can actually be delivered.
+const V1_MAX_ATTACHMENT_FILE_BYTES = 2 * 1024 * 1024;
+const V1_MAX_TOTAL_ATTACHMENT_BYTES = 1 * 1024 * 1024;
+// Base64 inflates bytes by 4/3: 1 MB of attachments is ~1.4 MB of
+// JSON, plus text (100k) + html (200k) caps — 2 MB bounds the body.
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
+// Max base64 chars for a 2 MB file: ceil(2 MiB / 3) * 4.
+const MAX_BASE64_CHARS = 2800000;
+
+// Content-type allow-list — the SAME list as the UI upload path
+// (POST /api/attachments `allowed`). Keep the two in sync: a type
+// added here must also be added there, and vice versa.
+const ALLOWED_V1_ATTACHMENT_TYPES = new Set([
+  'application/pdf',
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'text/plain',
+  'text/csv',
+  'application/zip',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+]);
+
+const attachmentRefSchema = z
+  .object({
+    attachment_id: z.string().min(1).max(200).optional(),
+    object_key: z.string().min(1).max(500).optional(),
+    file_name: z.string().min(1).max(150).optional(),
+    content_type: z.string().min(1).max(255).optional(),
+    size_bytes: z.number().int().positive().max(25 * 1024 * 1024).optional(),
+  })
+  .refine(
+    (x) =>
+      !!(x.attachment_id || x.object_key) &&
+      (!x.object_key || (x.file_name && x.size_bytes !== undefined)),
+    {message: 'Each attachment needs attachment_id, or object_key with file_name and size_bytes.'},
+  );
+
+const attachmentBase64Schema = z.object({
+  filename: z.string().min(1).max(150),
+  content_type: z.string().min(1).max(255),
+  content_base64: z.string().min(1).max(MAX_BASE64_CHARS),
+});
 
 const schema = z
   .object({
@@ -41,34 +109,108 @@ const schema = z
     text: z.string().max(100000).optional(),
     html: z.string().max(200000).optional(),
     template_id: z.string().uuid().optional(),
+    variables: z.record(z.string().max(2000)).optional(),
     provider: z.enum(['auto', 'sendpulse', 'brevo', 'mailjet', 'resend']).default('auto'),
     mailbox_id: z.string().uuid().optional(),
     thread_id: z.string().uuid().optional(),
     in_reply_to: z.string().max(998).optional(),
     idempotency_key: z.string().max(200).optional(),
-    attachments: z
-      .array(
-        z
-          .object({
-            attachment_id: z.string().min(1).max(200).optional(),
-            object_key: z.string().min(1).max(500).optional(),
-            file_name: z.string().min(1).max(150).optional(),
-            content_type: z.string().min(1).max(255).optional(),
-            size_bytes: z.number().int().positive().max(25 * 1024 * 1024).optional(),
-          })
-          .refine(
-            (x) =>
-              !!(x.attachment_id || x.object_key) &&
-              (!x.object_key || (x.file_name && x.size_bytes !== undefined)),
-            {message: 'Each attachment needs attachment_id, or object_key with file_name and size_bytes.'},
-          ),
-      )
-      .max(10)
-      .optional(),
+    attachments: z.array(z.union([attachmentRefSchema, attachmentBase64Schema])).max(10).optional(),
   })
-  .refine((x) => !!(x.text || x.html));
+  .refine((x) => !!(x.text || x.html || x.template_id));
 
-const MAX_BODY_BYTES = 300 * 1024;
+type Base64AttachmentInput = z.infer<typeof attachmentBase64Schema>;
+
+/** Same filename sanitising as POST /api/attachments. */
+function sanitizeFilename(name: string): string {
+  return name.normalize('NFKC').replace(/[^\w.() -]/g, '_').slice(0, 150) || 'attachment';
+}
+
+/**
+ * Strict base64 decode. Node's decoder silently ignores invalid
+ * characters, so the input is gated first (whitespace stripped,
+ * length a multiple of 4, base64 alphabet only) and the decode is
+ * verified by re-encoding: a non-canonical encoding is rejected.
+ * Returns null on any invalid input.
+ */
+function decodeBase64Strict(raw: string): Buffer | null {
+  const compact = raw.replace(/\s+/g, '');
+  if (!compact || compact.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(compact)) return null;
+  const buf = Buffer.from(compact, 'base64');
+  if (buf.toString('base64') !== compact) return null;
+  return buf;
+}
+
+/**
+ * Validate + store inline-base64 attachments in KV (the UI compose
+ * mechanism — see module header), returning the object_key refs that
+ * executeSend resolves. Runs BEFORE executeSend, so a 400/413/502
+ * here never reserves the idempotency key. Only the refs (never the
+ * base64 bytes) are returned, so nothing bulky lands in D1 payloads.
+ */
+async function uploadBase64Attachments(
+  workspaceId: string,
+  mailboxId: string,
+  inputs: Base64AttachmentInput[],
+): Promise<
+  | {ok: true; refs: SendAttachmentRef[]; objectKeys: string[]}
+  | {ok: false; status: 400 | 413 | 502; error: string}
+> {
+  let total = 0;
+  const decoded: Array<{fileName: string; contentType: string; bytes: Buffer}> = [];
+  for (const input of inputs) {
+    const fileName = sanitizeFilename(input.filename);
+    if (!ALLOWED_V1_ATTACHMENT_TYPES.has(input.content_type))
+      return {
+        ok: false,
+        status: 400,
+        error: `Attachment "${fileName}": content_type "${input.content_type}" is not allowed. Allowed types: PDF, PNG, JPEG, GIF, WebP, plain text, CSV, ZIP, Word (.docx), Excel (.xlsx).`,
+      };
+    const bytes = decodeBase64Strict(input.content_base64);
+    if (!bytes)
+      return {
+        ok: false,
+        status: 400,
+        error: `Attachment "${fileName}": content_base64 is not valid base64.`,
+      };
+    if (bytes.length < 1 || bytes.length > V1_MAX_ATTACHMENT_FILE_BYTES)
+      return {
+        ok: false,
+        status: 413,
+        error: `Attachment "${fileName}" exceeds the 2 MB per-file limit for API sends.`,
+      };
+    total += bytes.length;
+    if (total > V1_MAX_TOTAL_ATTACHMENT_BYTES)
+      return {
+        ok: false,
+        status: 413,
+        error: 'Attachments exceed the 1 MB total limit for API sends.',
+      };
+    decoded.push({fileName, contentType: input.content_type, bytes});
+  }
+  const refs: SendAttachmentRef[] = [];
+  const objectKeys: string[] = [];
+  for (const f of decoded) {
+    const digest = createHash('sha256').update(f.bytes).digest('hex');
+    const objectKey = `att/${workspaceId}/${mailboxId}/${digest}-${f.fileName}`;
+    try {
+      await kvPut(objectKey, f.bytes, f.contentType);
+    } catch {
+      // Roll back the files already stored for this request.
+      await Promise.all(objectKeys.map((k) => kvDelete(k).catch(() => {})));
+      return {ok: false, status: 502, error: 'Could not store attachment.'};
+    }
+    objectKeys.push(objectKey);
+    refs.push({
+      object_key: objectKey,
+      file_name: f.fileName,
+      content_type: f.contentType,
+      size_bytes: f.bytes.length,
+    });
+  }
+  return {ok: true, refs, objectKeys};
+}
 
 // Same thread resolution as POST /api/send (G-11): explicit thread_id
 // wins; else join the thread of the message named by in_reply_to; else
@@ -104,7 +246,7 @@ async function recordOutboundJob(input: {
   exec: SendExecution;
   threadId?: string;
   inReplyTo?: string;
-  attachments?: Array<{attachment_id?: string; object_key?: string; file_name?: string; content_type?: string; size_bytes?: number}>;
+  attachments?: SendAttachmentRef[];
 }): Promise<void> {
   const {exec} = input;
   if (exec.outcome === 'duplicate') return;
@@ -116,9 +258,9 @@ async function recordOutboundJob(input: {
     ]);
     const payload = JSON.stringify({
       to: input.to,
-      subject: input.subject,
-      text: input.text || '',
-      html: input.html || '',
+      subject: input.exec.rendered?.subject ?? input.subject,
+      text: input.exec.rendered?.text ?? input.text ?? '',
+      html: input.exec.rendered?.html ?? input.html ?? '',
       mailboxId: input.mailboxId,
       mailboxAddress: box ? String(box.address) : '',
       domainId: box ? String(box.domain_id) : '',
@@ -187,11 +329,6 @@ export async function POST(req: Request) {
   if (!parsed.success)
     return NextResponse.json({error: 'Invalid message', details: parsed.error.flatten()}, {status: 400});
   const d = parsed.data;
-  if (d.template_id)
-    return NextResponse.json(
-      {error: 'template_id is not available yet — email templates ship with Phase 1; send text/html directly for now.'},
-      {status: 400},
-    );
 
   // Resolve the sender mailbox: explicit id must belong to this
   // workspace and be active (foreign/nonexistent ids get the same
@@ -209,6 +346,25 @@ export async function POST(req: Request) {
   if (!box)
     return NextResponse.json({error: 'No mailbox available for this workspace.'}, {status: 403});
 
+  // Inline-base64 attachments are decoded + stored in KV BEFORE the
+  // send runs (so a bad file never reserves the idempotency key).
+  // The merged refs — uploaded files + any KV refs the caller passed
+  // — are what executeSend resolves, exactly as for the UI path.
+  const base64Inputs = (d.attachments || []).filter(
+    (a): a is Base64AttachmentInput => 'content_base64' in a,
+  );
+  const refAttachments: SendAttachmentRef[] = (d.attachments || []).filter(
+    (a): a is SendAttachmentRef => !('content_base64' in a),
+  );
+  let uploadedObjectKeys: string[] = [];
+  let attachments: SendAttachmentRef[] = refAttachments;
+  if (base64Inputs.length > 0) {
+    const uploaded = await uploadBase64Attachments(key.workspaceId, String(box.id), base64Inputs);
+    if (!uploaded.ok) return NextResponse.json({error: uploaded.error}, {status: uploaded.status});
+    uploadedObjectKeys = uploaded.objectKeys;
+    attachments = [...refAttachments, ...uploaded.refs];
+  }
+
   const idempotencyKey = req.headers.get('idempotency-key') || d.idempotency_key || randomUUID();
   const exec = await executeSend(
     {
@@ -225,10 +381,21 @@ export async function POST(req: Request) {
       html: d.html,
       idempotencyKey,
       provider: d.provider,
-      attachments: d.attachments,
+      attachments,
+      templateId: d.template_id,
+      variables: d.variables,
     },
     {kind: 'user', userId: key.createdBy},
   );
+  // Terminal rejections only: the send did not happen and nothing
+  // will retry it, so the KV files uploaded for this request are
+  // removed (a later retry re-uploads them — the keys are content
+  // derived). Accepted / duplicate / unknown / failed outcomes KEEP
+  // the files: the sent message references them, or the retry worker
+  // re-resolves them from the stored outbound-jobs payload.
+  if ((exec.outcome === 'rejected' || exec.outcome === 'suppressed') && uploadedObjectKeys.length > 0) {
+    await Promise.all(uploadedObjectKeys.map((k) => kvDelete(k).catch(() => {})));
+  }
   await recordOutboundJob({
     workspaceId: key.workspaceId,
     mailboxId: String(box.id),
@@ -240,7 +407,7 @@ export async function POST(req: Request) {
     exec,
     threadId: d.thread_id,
     inReplyTo: d.in_reply_to,
-    attachments: d.attachments,
+    attachments,
   });
   return NextResponse.json(exec.body, {status: exec.status});
 }
