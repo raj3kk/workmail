@@ -427,12 +427,6 @@ CREATE TRIGGER IF NOT EXISTS outbound_jobs_updated_at AFTER UPDATE ON outbound_j
 -- this table unless its WHERE clause uses the composite PK.
 CREATE TRIGGER IF NOT EXISTS user_controls_updated_at AFTER UPDATE ON platform_user_controls FOR EACH ROW BEGIN UPDATE platform_user_controls SET updated_at = datetime('now') WHERE user_id = NEW.user_id; END;
 
--- New workspace gets a free subscription (replaces the previous database trigger).
-CREATE TRIGGER IF NOT EXISTS workspace_default_subscription AFTER INSERT ON workspaces FOR EACH ROW BEGIN
-  INSERT OR IGNORE INTO subscriptions (id, workspace_id, plan_id, status, created_at, updated_at)
-  VALUES (lower(hex(randomblob(16))), NEW.id, 'free', 'active', datetime('now'), datetime('now'));
-END;
-
 -- New mailbox auto-assigns the workspace owner as manager.
 CREATE TRIGGER IF NOT EXISTS mailbox_owner_access AFTER INSERT ON mailboxes FOR EACH ROW BEGIN
   INSERT OR IGNORE INTO mailbox_members (mailbox_id, user_id, permission)
