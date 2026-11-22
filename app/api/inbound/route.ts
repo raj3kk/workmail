@@ -1,7 +1,7 @@
 import {NextResponse} from 'next/server';
 import {z} from 'zod';
 import {timingSafeEqual} from 'node:crypto';
-import {dbOne, dbRun, newId, nowIso} from '@/lib/db';
+import {dbOne, dbQuery, dbRun, newId, nowIso} from '@/lib/db';
 import {kvPut, kvDelete} from '@/lib/kv';
 import {maybeAutoReply} from '@/lib/ai';
 import {applyMailRules} from '@/lib/filters';
@@ -28,6 +28,13 @@ const attachmentSchema = z.object({
 
 const schema = z.object({
   from: z.string().email(),
+  // MIME Reply-To header — the real reply target. The SMTP envelope
+  // sender (Return-Path, a provider bounce address) must never be
+  // replied to (2026-11-22: four auto-replies went to bounce
+  // addresses because the worker passed the envelope as the From).
+  replyTo: z.string().email().optional(),
+  // SMTP envelope sender (Return-Path), kept for diagnosis only.
+  envelopeFrom: z.string().email().optional(),
   to: z.string().email(),
   subject: z.string().max(998).optional(),
   text: z.string().max(500000).optional(),
@@ -246,12 +253,22 @@ export async function POST(req: Request) {
   // human review. Never throws and never changes the 202 acceptance of
   // the inbound message.
   try {
+    // Own-mailbox addresses for the auto-reply loop guard (a reply to
+    // ANY workspace mailbox is suppressed, not just the receiving one).
+    const ownMailboxRows = await dbQuery('SELECT address FROM mailboxes WHERE workspace_id = ? AND is_active = 1', [box.workspace_id]).catch(() => []);
+    const ownMailboxAddresses = (ownMailboxRows || []).map((r: any) => String(r.address).toLowerCase());
     await maybeAutoReply({
       workspaceId: String(box.workspace_id),
       mailboxId: String(box.id),
       mailboxAddress: d.to.toLowerCase(),
       messageId,
+      // `from` is the MIME From header (the worker sends the header
+      // From; the envelope sender arrives separately as envelopeFrom
+      // and is never replied to). replyTo, when present, is the target.
       from: d.from,
+      replyTo: d.replyTo,
+      html: d.html,
+      ownAddresses: ownMailboxAddresses,
       subject: d.subject || '(No Subject)',
       body: d.text || '',
     });
