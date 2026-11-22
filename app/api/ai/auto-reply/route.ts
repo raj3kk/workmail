@@ -102,6 +102,12 @@ export async function POST(req: Request) {
     if (q.data.action === 'discard') {
       await dbRun("UPDATE messages SET folder = 'trash', updated_at = ? WHERE id = ?", [nowIso(), q.data.draft_id]);
     }
+    if (q.data.action === 'sent') {
+      // The queued draft was transmitted: move its draft row to Trash
+      // (mirroring 'discard') so a queued send leaves no orphan draft
+      // behind (B-c — sendQueued never cleaned up).
+      await dbRun("UPDATE messages SET folder = 'trash', updated_at = ? WHERE id = ?", [nowIso(), q.data.draft_id]);
+    }
     await logAiAction({
       action:
         q.data.action === 'approve'
