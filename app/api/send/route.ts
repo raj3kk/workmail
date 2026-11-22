@@ -34,6 +34,13 @@ const schema = z
     // except that the header idempotency key still takes precedence.
     service_context: z.string().max(64).optional(),
     idempotency_key: z.string().max(200).optional(),
+    // Provider pick (F1/F2): 'auto' = fallback chain (default), or one
+    // of the four providers for a manual single-provider send. The
+    // service path forces 'auto' regardless of what is passed here.
+    provider: z.enum(['auto', 'sendpulse', 'brevo', 'mailjet', 'resend']).default('auto'),
+    // Draft row id to delete once the send is provider-accepted
+    // (server-side B-c cleanup; accepted sends only).
+    draft_id: z.string().min(1).max(200).optional(),
     // Attachments (see lib/service-send.ts `resolveSendAttachments`).
     // Each entry is either `{attachment_id}` (a message_attachments row
     // id belonging to the sender's workspace + mailbox) or
@@ -246,6 +253,7 @@ export async function POST(req: Request) {
       text: d.text,
       html: d.html,
       idempotencyKey,
+      draftId: d.draft_id,
       attachments: d.attachments,
     });
     await recordOutboundJob({
@@ -303,6 +311,8 @@ export async function POST(req: Request) {
       text: d.text,
       html: d.html,
       idempotencyKey,
+      provider: d.provider,
+      draftId: d.draft_id,
       attachments: d.attachments,
     },
     {kind: 'user', userId: user.id},
